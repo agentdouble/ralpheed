@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
-from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -16,7 +20,11 @@ from pydantic import BaseModel, Field
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 PRD_PATH = ROOT_DIR / "prd.json"
+RALPH_SCRIPT_PATH = ROOT_DIR / "ralph.sh"
 DEFAULT_BRANCH_NAME = "ralph/feature"
+DEFAULT_AGENT_ID = "agent-1"
+DEFAULT_AGENT_NAME = "Ralph"
+MAX_LOG_LINES = 220
 
 load_dotenv(dotenv_path=ROOT_DIR / ".env", override=False)
 
@@ -42,7 +50,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-TaskStatus = Literal["backlog", "plan", "ready", "active", "review", "done"]
+TaskStatus = Literal["backlog", "todo", "review", "done"]
 ReviewDecision = Literal["approved", "rejected"]
 AgentStatus = Literal["waiting", "running"]
 AgentSignal = Literal["RALPH_WAITING", "RALPH_RUNNING"]
@@ -73,6 +81,20 @@ class AgentState:
     current_task_id: str | None
 
 
+@dataclass
+class AgentBoard:
+    id: str
+    name: str
+    branch_name: str
+    workspace_path: str
+    tasks: dict[str, TaskState]
+    order: list[str]
+    task_sequence: int
+    agent: AgentState
+    logs: list[str]
+    worker: asyncio.Task[None] | None = None
+
+
 class TaskResponse(BaseModel):
     id: str
     title: str
@@ -90,10 +112,23 @@ class TaskResponse(BaseModel):
 
 
 class AgentResponse(BaseModel):
+    id: str
+    name: str
     status: AgentStatus
     signal: AgentSignal
     last_update: datetime
     current_task_id: str | None
+
+
+class AgentSummary(BaseModel):
+    id: str
+    name: str
+    status: AgentStatus
+    current_task_id: str | None
+
+
+class AgentsResponse(BaseModel):
+    agents: list[AgentSummary]
 
 
 class BoardStateResponse(BaseModel):
@@ -101,6 +136,10 @@ class BoardStateResponse(BaseModel):
     tasks: list[TaskResponse]
     logs: list[str]
     workspace_path: str
+
+
+class CreateAgentRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=80)
 
 
 class CreateTaskRequest(BaseModel):
@@ -129,37 +168,27 @@ class WorkspaceRequest(BaseModel):
     path: str = Field(default="", max_length=512)
 
 
-TASKS: dict[str, TaskState] = {}
-TASK_ORDER: list[str] = []
-TASK_SEQUENCE = 1
-BRANCH_NAME = DEFAULT_BRANCH_NAME
-WORKSPACE_PATH = ""
+class StartRalphRequest(BaseModel):
+    iterations: int | None = Field(default=None, ge=1)
+
+
+AGENTS: dict[str, AgentBoard] = {}
+AGENT_ORDER: list[str] = []
+AGENT_SEQUENCE = 1
 
 STATE_LOCK = asyncio.Lock()
-RALPH_WORKER: asyncio.Task[None] | None = None
-
-AGENT = AgentState(
-    status="waiting",
-    signal="RALPH_WAITING",
-    last_update=datetime.now(timezone.utc),
-    current_task_id=None,
-)
-
-LOGS: list[str] = []
-MAX_LOG_LINES = 220
-PROCESSING_DELAY_SECONDS = 2.2
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _append_log(message: str) -> None:
+def _append_log(board: AgentBoard, message: str) -> None:
     timestamp = _utc_now().strftime("%H:%M:%S")
-    LOGS.append(f"{timestamp}  {message}")
-    if len(LOGS) > MAX_LOG_LINES:
-        excess = len(LOGS) - MAX_LOG_LINES
-        del LOGS[:excess]
+    board.logs.append(f"{timestamp}  {message}")
+    if len(board.logs) > MAX_LOG_LINES:
+        excess = len(board.logs) - MAX_LOG_LINES
+        del board.logs[:excess]
 
 
 def _normalize_acceptance(raw: object) -> list[str]:
@@ -194,15 +223,12 @@ def _normalize_priority(raw: object) -> int:
 
 
 def _normalize_status(raw: object) -> TaskStatus:
-    if isinstance(raw, str) and raw in (
-        "backlog",
-        "plan",
-        "ready",
-        "active",
-        "review",
-        "done",
-    ):
+    if not isinstance(raw, str):
+        return "backlog"
+    if raw in ("backlog", "todo", "review", "done"):
         return raw
+    if raw in ("plan", "ready", "active"):
+        return "todo"
     return "backlog"
 
 
@@ -216,9 +242,25 @@ def _extract_sequence(task_id: str) -> int:
     return 0
 
 
+def _extract_agent_sequence(agent_id: str) -> int:
+    parts = agent_id.split("-")
+    if len(parts) < 2:
+        return 0
+    suffix = parts[-1]
+    if suffix.isdigit():
+        return int(suffix)
+    return 0
+
+
+def _default_agent_name(sequence: int) -> str:
+    if sequence <= 1:
+        return DEFAULT_AGENT_NAME
+    return f"{DEFAULT_AGENT_NAME} {sequence}"
+
+
 def _read_prd() -> dict[str, object]:
     if not PRD_PATH.exists():
-        return {"branchName": DEFAULT_BRANCH_NAME, "workspacePath": "", "userStories": []}
+        return {"agents": []}
     return json.loads(PRD_PATH.read_text(encoding="utf-8"))
 
 
@@ -250,28 +292,256 @@ def _task_to_story(task: TaskState) -> dict[str, object]:
 
 
 def _persist_prd() -> None:
-    stories = []
-    for task_id in TASK_ORDER:
-        task = TASKS.get(task_id)
-        if task:
-            stories.append(_task_to_story(task))
-    data = {"branchName": BRANCH_NAME, "workspacePath": WORKSPACE_PATH, "userStories": stories}
-    _write_prd(data)
-
-
-def _load_prd_state() -> None:
-    global BRANCH_NAME, TASKS, TASK_ORDER, TASK_SEQUENCE, WORKSPACE_PATH
-
-    data = _read_prd()
-    branch = data.get("branchName")
-    BRANCH_NAME = branch if isinstance(branch, str) and branch.strip() else DEFAULT_BRANCH_NAME
-    workspace_path = data.get("workspacePath")
-    WORKSPACE_PATH = workspace_path if isinstance(workspace_path, str) else ""
-
-    stories = data.get("userStories")
-    if not isinstance(stories, list):
+    agents_payload: list[dict[str, object]] = []
+    for agent_id in AGENT_ORDER:
+        board = AGENTS.get(agent_id)
+        if not board:
+            continue
         stories = []
+        for task_id in board.order:
+            task = board.tasks.get(task_id)
+            if task:
+                stories.append(_task_to_story(task))
+        agents_payload.append(
+            {
+                "id": board.id,
+                "name": board.name,
+                "branchName": board.branch_name,
+                "workspacePath": board.workspace_path,
+                "userStories": stories,
+            }
+        )
+    _write_prd({"agents": agents_payload})
 
+
+def _any_worker_running() -> bool:
+    return any(board.worker and not board.worker.done() for board in AGENTS.values())
+
+
+def _ensure_mutation_allowed() -> None:
+    if _any_worker_running():
+        raise HTTPException(status_code=409, detail="Ralph is running")
+
+
+def _resolve_workspace_path(board: AgentBoard) -> Path | None:
+    raw = board.workspace_path.strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (ROOT_DIR / path).resolve()
+    if not path.is_dir():
+        return None
+    return path
+
+
+def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False)
+
+
+def _resolve_repo_root(path: Path) -> Path | None:
+    result = _run_git(["git", "rev-parse", "--show-toplevel"], path)
+    if result.returncode != 0:
+        return None
+    root = Path(result.stdout.strip())
+    if not root.is_dir():
+        return None
+    return root
+
+
+def _worktrees_root(repo_root: Path) -> Path:
+    return repo_root.parent / f"{repo_root.name}-worktrees"
+
+
+def _sanitize_branch_name(branch: str) -> str:
+    cleaned = branch.strip().replace("/", "__")
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", cleaned)
+    cleaned = cleaned.strip("-")
+    return cleaned or "worktree"
+
+
+def _default_branch_for_task(task: TaskState) -> str:
+    return f"feat/{task.id.lower()}"
+
+
+async def _ensure_worktree_path(repo_root: Path, branch: str) -> tuple[Path | None, str | None]:
+    worktrees_root = _worktrees_root(repo_root)
+    worktrees_root.mkdir(parents=True, exist_ok=True)
+    worktree_path = worktrees_root / _sanitize_branch_name(branch)
+
+    if worktree_path.exists():
+        if not worktree_path.is_dir():
+            return None, f"invalid path {worktree_path}"
+
+        result = await asyncio.to_thread(
+            _run_git,
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            worktree_path,
+        )
+        if result.returncode != 0:
+            error = result.stderr.strip() or "unable to read worktree"
+            return None, error
+        current_branch = result.stdout.strip()
+        if current_branch != branch:
+            return None, f"{worktree_path} on {current_branch}, expected {branch}"
+        return worktree_path, None
+
+    exists_result = await asyncio.to_thread(
+        _run_git,
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        repo_root,
+    )
+    if exists_result.returncode == 0:
+        cmd = ["git", "worktree", "add", str(worktree_path), branch]
+    else:
+        cmd = ["git", "worktree", "add", "-b", branch, str(worktree_path)]
+    result = await asyncio.to_thread(_run_git, cmd, repo_root)
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout).strip() or "unable to create worktree"
+        return None, error
+    return worktree_path, None
+
+
+def _escape_osascript(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _launch_codex_terminal(worktree_path: Path) -> tuple[bool, str]:
+    if not shutil.which("codex"):
+        return False, "codex not found"
+
+    command = f"cd {shlex.quote(str(worktree_path))} && codex"
+    if sys.platform == "darwin":
+        script = (
+            'tell application "iTerm"\n'
+            "activate\n"
+            "set newWindow to (create window with default profile)\n"
+            f'tell current session of newWindow to write text "{_escape_osascript(command)}"\n'
+            "end tell"
+        )
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            error = result.stderr.strip() or "unable to open iTerm"
+            return False, error
+        return True, ""
+
+    if sys.platform.startswith("linux"):
+        terminal = (
+            shutil.which("x-terminal-emulator")
+            or shutil.which("gnome-terminal")
+            or shutil.which("konsole")
+            or shutil.which("xterm")
+        )
+        if not terminal:
+            return False, "no terminal available"
+        if terminal.endswith("gnome-terminal"):
+            args = [terminal, "--", "bash", "-lc", command]
+        else:
+            args = [terminal, "-e", "bash", "-lc", command]
+        subprocess.Popen(args, cwd=str(worktree_path))
+        return True, ""
+
+    if sys.platform == "win32":
+        args = ["cmd", "/c", "start", "cmd", "/k", f"cd /d {worktree_path} && codex"]
+        subprocess.Popen(args)
+        return True, ""
+
+    return False, "unsupported platform"
+
+
+def _resolve_codex_prompt(name: str) -> tuple[str | None, Path | None]:
+    candidates = [
+        ROOT_DIR / "prompts" / f"{name}.md",
+        Path.home() / ".codex" / "prompts" / f"{name}.md",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            try:
+                return candidate.read_text(encoding="utf-8"), candidate
+            except OSError:
+                continue
+    return None, None
+
+
+def _copy_env_files(source: Path, dest: Path) -> list[str]:
+    copied: list[str] = []
+    if not source.is_dir() or not dest.is_dir():
+        return copied
+    for item in source.iterdir():
+        if not item.is_file():
+            continue
+        name = item.name
+        if name == ".env" or name.startswith(".env."):
+            shutil.copy2(item, dest / name)
+            copied.append(name)
+    return copied
+
+
+def _select_task_for_run(board: AgentBoard) -> TaskState | None:
+    best: TaskState | None = None
+    best_key: tuple[int, int] | None = None
+    for index, task_id in enumerate(board.order):
+        task = board.tasks.get(task_id)
+        if not task or task.passes or task.status != "todo":
+            continue
+        key = (task.priority, index)
+        if best_key is None or key < best_key:
+            best = task
+            best_key = key
+    return best
+
+
+def _sync_board_from_prd(board: AgentBoard) -> None:
+    data = _read_prd()
+    agents_raw = data.get("agents")
+    if isinstance(agents_raw, list) and agents_raw:
+        agent_items = agents_raw
+    else:
+        agent_items = [
+            {
+                "id": DEFAULT_AGENT_ID,
+                "name": DEFAULT_AGENT_NAME,
+                "branchName": data.get("branchName"),
+                "workspacePath": data.get("workspacePath"),
+                "userStories": data.get("userStories"),
+            }
+        ]
+
+    for index, raw in enumerate(agent_items, start=1):
+        if not isinstance(raw, dict):
+            continue
+        raw_id = str(raw.get("id") or "").strip()
+        agent_id = raw_id or (DEFAULT_AGENT_ID if index == 1 else f"agent-{index}")
+        if agent_id != board.id:
+            continue
+
+        raw_name = str(raw.get("name") or "").strip()
+        sequence = _extract_agent_sequence(agent_id) or index
+        name = raw_name or _default_agent_name(sequence)
+
+        branch_raw = raw.get("branchName")
+        if isinstance(branch_raw, str) and branch_raw.strip():
+            branch_name = branch_raw.strip()
+        else:
+            branch_name = DEFAULT_BRANCH_NAME
+
+        workspace_raw = raw.get("workspacePath")
+        workspace_path = workspace_raw if isinstance(workspace_raw, str) else ""
+
+        stories_raw = raw.get("userStories")
+        stories = stories_raw if isinstance(stories_raw, list) else []
+
+        tasks, order, sequence = _load_tasks_from_stories(stories)
+        board.name = name
+        board.branch_name = branch_name
+        board.workspace_path = workspace_path
+        board.tasks = tasks
+        board.order = order
+        board.task_sequence = sequence
+        return
+
+
+def _load_tasks_from_stories(stories: list[object]) -> tuple[dict[str, TaskState], list[str], int]:
     tasks: dict[str, TaskState] = {}
     order: list[str] = []
     highest = 0
@@ -288,6 +558,8 @@ def _load_prd_state() -> None:
         passes = raw.get("passes") is True
         notes = str(raw.get("notes") or "")
         status = _normalize_status(raw.get("status"))
+        if passes and status != "done":
+            status = "review"
         owner = str(raw.get("owner") or "")
         effort = str(raw.get("effort") or "")
         branch = str(raw.get("branch") or "")
@@ -313,9 +585,93 @@ def _load_prd_state() -> None:
         order.append(story_id)
         highest = max(highest, _extract_sequence(story_id))
 
-    TASKS = tasks
-    TASK_ORDER = order
-    TASK_SEQUENCE = highest + 1 if highest else max(len(order) + 1, 1)
+    sequence = highest + 1 if highest else max(len(order) + 1, 1)
+    return tasks, order, sequence
+
+
+def _create_board(
+    agent_id: str,
+    name: str,
+    branch_name: str,
+    workspace_path: str,
+    stories: list[object],
+) -> AgentBoard:
+    tasks, order, sequence = _load_tasks_from_stories(stories)
+    agent_state = AgentState(
+        status="waiting",
+        signal="RALPH_WAITING",
+        last_update=_utc_now(),
+        current_task_id=None,
+    )
+    return AgentBoard(
+        id=agent_id,
+        name=name,
+        branch_name=branch_name,
+        workspace_path=workspace_path,
+        tasks=tasks,
+        order=order,
+        task_sequence=sequence,
+        agent=agent_state,
+        logs=[],
+    )
+
+
+def _load_prd_state() -> None:
+    global AGENTS, AGENT_ORDER, AGENT_SEQUENCE
+
+    data = _read_prd()
+    agents_raw = data.get("agents")
+    if isinstance(agents_raw, list) and agents_raw:
+        agent_items = agents_raw
+    else:
+        agent_items = [
+            {
+                "id": DEFAULT_AGENT_ID,
+                "name": DEFAULT_AGENT_NAME,
+                "branchName": data.get("branchName"),
+                "workspacePath": data.get("workspacePath"),
+                "userStories": data.get("userStories"),
+            }
+        ]
+
+    agents: dict[str, AgentBoard] = {}
+    order: list[str] = []
+    highest = 0
+
+    for index, raw in enumerate(agent_items, start=1):
+        if not isinstance(raw, dict):
+            continue
+        raw_id = str(raw.get("id") or "").strip()
+        agent_id = raw_id or (DEFAULT_AGENT_ID if index == 1 else f"agent-{index}")
+        if agent_id in agents:
+            continue
+        raw_name = str(raw.get("name") or "").strip()
+        sequence = _extract_agent_sequence(agent_id) or index
+        name = raw_name or _default_agent_name(sequence)
+        branch_raw = raw.get("branchName")
+        if isinstance(branch_raw, str) and branch_raw.strip():
+            branch_name = branch_raw.strip()
+        else:
+            branch_name = DEFAULT_BRANCH_NAME
+        workspace_raw = raw.get("workspacePath")
+        workspace_path = workspace_raw if isinstance(workspace_raw, str) else ""
+        stories_raw = raw.get("userStories")
+        stories = stories_raw if isinstance(stories_raw, list) else []
+
+        board = _create_board(agent_id, name, branch_name, workspace_path, stories)
+        agents[agent_id] = board
+        order.append(agent_id)
+        highest = max(highest, _extract_agent_sequence(agent_id))
+
+    if not agents:
+        board = _create_board(DEFAULT_AGENT_ID, DEFAULT_AGENT_NAME, DEFAULT_BRANCH_NAME, "", [])
+        agents[DEFAULT_AGENT_ID] = board
+        order = [DEFAULT_AGENT_ID]
+        highest = _extract_agent_sequence(DEFAULT_AGENT_ID)
+
+    AGENTS = agents
+    AGENT_ORDER = order
+    AGENT_SEQUENCE = highest + 1 if highest else len(order) + 1
 
 
 def _task_to_response(task: TaskState) -> TaskResponse:
@@ -336,118 +692,380 @@ def _task_to_response(task: TaskState) -> TaskResponse:
     )
 
 
-def _agent_to_response() -> AgentResponse:
+def _agent_to_response(board: AgentBoard) -> AgentResponse:
     return AgentResponse(
-        status=AGENT.status,
-        signal=AGENT.signal,
-        last_update=AGENT.last_update,
-        current_task_id=AGENT.current_task_id,
+        id=board.id,
+        name=board.name,
+        status=board.agent.status,
+        signal=board.agent.signal,
+        last_update=board.agent.last_update,
+        current_task_id=board.agent.current_task_id,
     )
 
 
-def _board_state_response() -> BoardStateResponse:
-    tasks = [TASKS[task_id] for task_id in TASK_ORDER if task_id in TASKS]
+def _agent_to_summary(board: AgentBoard) -> AgentSummary:
+    return AgentSummary(
+        id=board.id,
+        name=board.name,
+        status=board.agent.status,
+        current_task_id=board.agent.current_task_id,
+    )
+
+
+def _board_state_response(board: AgentBoard) -> BoardStateResponse:
+    tasks = [board.tasks[task_id] for task_id in board.order if task_id in board.tasks]
     return BoardStateResponse(
-        agent=_agent_to_response(),
+        agent=_agent_to_response(board),
         tasks=[_task_to_response(task) for task in tasks],
-        logs=list(LOGS),
-        workspace_path=WORKSPACE_PATH,
+        logs=list(board.logs),
+        workspace_path=board.workspace_path,
     )
 
 
-def _generate_story_id() -> str:
-    global TASK_SEQUENCE
-
+def _generate_story_id(board: AgentBoard) -> str:
     while True:
-        candidate = f"US-{TASK_SEQUENCE:03d}"
-        TASK_SEQUENCE += 1
-        if candidate not in TASKS:
+        candidate = f"US-{board.task_sequence:03d}"
+        board.task_sequence += 1
+        if candidate not in board.tasks:
             return candidate
 
 
-def _suggest_effort(priority: int) -> str:
-    if priority <= 1:
-        return "2d"
-    if priority == 2:
-        return "1d"
-    return "0.5d"
+def _set_agent_waiting(board: AgentBoard) -> None:
+    board.agent.status = "waiting"
+    board.agent.signal = "RALPH_WAITING"
+    board.agent.current_task_id = None
+    board.agent.last_update = _utc_now()
 
 
-def _suggest_branch(task_id: str) -> str:
-    suffix = uuid4().hex[:4]
-    return f"feat/{task_id.lower()}-{suffix}"
+def _set_agent_running(board: AgentBoard, task_id: str | None) -> None:
+    board.agent.status = "running"
+    board.agent.signal = "RALPH_RUNNING"
+    board.agent.current_task_id = task_id
+    board.agent.last_update = _utc_now()
 
 
-def _suggest_commit() -> str:
-    return uuid4().hex[:7]
+def _resolve_agent_id(agent_id: str | None) -> str:
+    candidate = (agent_id or "").strip()
+    if candidate:
+        return candidate
+    if AGENT_ORDER:
+        return AGENT_ORDER[0]
+    return DEFAULT_AGENT_ID
 
 
-def _set_agent_waiting() -> None:
-    AGENT.status = "waiting"
-    AGENT.signal = "RALPH_WAITING"
-    AGENT.current_task_id = None
-    AGENT.last_update = _utc_now()
+def _get_board(agent_id: str | None) -> AgentBoard:
+    resolved = _resolve_agent_id(agent_id)
+    board = AGENTS.get(resolved)
+    if not board:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return board
 
 
-def _set_agent_running(task_id: str | None) -> None:
-    AGENT.status = "running"
-    AGENT.signal = "RALPH_RUNNING"
-    AGENT.current_task_id = task_id
-    AGENT.last_update = _utc_now()
+def _next_agent_id() -> str:
+    global AGENT_SEQUENCE
+
+    while True:
+        candidate = f"agent-{AGENT_SEQUENCE}"
+        AGENT_SEQUENCE += 1
+        if candidate not in AGENTS:
+            return candidate
 
 
-def _next_ready_task() -> TaskState | None:
-    for task_id in TASK_ORDER:
-        task = TASKS.get(task_id)
-        if task and task.status == "ready":
-            return task
-    return None
+def _start_worker(board: AgentBoard, iterations: int | None = None) -> None:
+    if board.worker and not board.worker.done():
+        return
+    board.worker = asyncio.create_task(_agent_worker_loop(board.id, iterations))
 
 
-async def _ralph_worker_loop() -> None:
+def _start_openpr_worker(board: AgentBoard, task_id: str) -> None:
+    if board.worker and not board.worker.done():
+        return
+    board.worker = asyncio.create_task(_openpr_worker_loop(board.id, task_id))
+
+
+async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> None:
+    proc: asyncio.subprocess.Process | None = None
+    workspace_path: Path | None = None
     try:
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if not board:
+                return
+
+            if not RALPH_SCRIPT_PATH.exists():
+                _append_log(board, "RALPH_ERROR - ralph.sh not found")
+                _set_agent_waiting(board)
+                return
+
+            workspace_path = _resolve_workspace_path(board)
+            if not workspace_path:
+                _append_log(board, "WORKSPACE_INVALID - Set a valid workspace path before starting.")
+                _set_agent_waiting(board)
+                return
+
+        repo_root = await asyncio.to_thread(_resolve_repo_root, workspace_path)
+        if not repo_root:
+            async with STATE_LOCK:
+                board = AGENTS.get(agent_id)
+                if not board:
+                    return
+                _append_log(board, "WORKSPACE_INVALID - Not a git repository")
+                _set_agent_waiting(board)
+            return
+
+        worktrees_root = _worktrees_root(repo_root)
+        worktrees_root.mkdir(parents=True, exist_ok=True)
+
+        max_rounds = iterations if iterations is not None else 1
+        round_index = 0
+
         while True:
             async with STATE_LOCK:
-                task = _next_ready_task()
-                if not task:
-                    _set_agent_waiting()
-                    _append_log("RALPH_WAITING - No tasks in ready queue")
+                board = AGENTS.get(agent_id)
+                if not board:
                     return
 
-                task.status = "active"
-                task.owner = task.owner or "Ralph"
-                task.updated_at = _utc_now()
-                _set_agent_running(task.id)
-                _append_log(f"RALPH_RUNNING - Started {task.id}: {task.title}")
-                _persist_prd()
+                todo_ids = [
+                    task_id
+                    for task_id in board.order
+                    if (task := board.tasks.get(task_id)) and task.status == "todo" and not task.passes
+                ]
 
-            await asyncio.sleep(PROCESSING_DELAY_SECONDS)
-
-            async with STATE_LOCK:
-                refreshed = TASKS.get(task.id)
-                if not refreshed or refreshed.status != "active":
-                    _append_log(f"RALPH_WARNING - Skipped {task.id} (task changed during processing)")
-                    continue
-
-                refreshed.effort = refreshed.effort or _suggest_effort(refreshed.priority)
-                refreshed.branch = refreshed.branch or _suggest_branch(refreshed.id)
-                refreshed.commit = refreshed.commit or _suggest_commit()
-                refreshed.summary = refreshed.summary or "Auto-filled by Ralph."
-                refreshed.status = "review"
-                refreshed.updated_at = _utc_now()
-
-                _append_log(f"RALPH_REVIEW - Ready: {refreshed.id} waiting for human review")
-                _set_agent_running(None)
-                _persist_prd()
-
-                if not any(task.status == "ready" for task in TASKS.values()):
-                    _set_agent_waiting()
-                    _append_log("RALPH_WAITING - Queue empty")
+                if not todo_ids:
+                    _set_agent_waiting(board)
+                    _append_log(board, "RALPH_WAITING - No todo tasks")
                     return
+
+                if round_index >= max_rounds:
+                    _set_agent_waiting(board)
+                    _append_log(board, "RALPH_WAITING - Max rounds reached")
+                    return
+
+                round_index += 1
+                _append_log(board, f"RALPH_ROUND - {round_index}/{max_rounds} ({len(todo_ids)} tasks)")
+
+            for task_id in todo_ids:
+                async with STATE_LOCK:
+                    board = AGENTS.get(agent_id)
+                    if not board:
+                        return
+
+                    task = board.tasks.get(task_id)
+                    if not task or task.status != "todo" or task.passes:
+                        continue
+
+                    branch = task.branch.strip() or _default_branch_for_task(task)
+                    if branch != task.branch:
+                        task.branch = branch
+                        task.updated_at = _utc_now()
+                        _append_log(board, f"BRANCH_SET - {task.id} {branch}")
+                        _persist_prd()
+
+                    _set_agent_running(board, task.id)
+                    _append_log(board, f"RALPH_PREP - {task.id} on {branch}")
+
+                worktree_path, error = await _ensure_worktree_path(repo_root, branch)
+                if not worktree_path:
+                    async with STATE_LOCK:
+                        board = AGENTS.get(agent_id)
+                        if not board:
+                            return
+                        _append_log(board, f"WORKTREE_ERROR - {error}")
+                        _set_agent_waiting(board)
+                    return
+
+                copied = _copy_env_files(repo_root, worktree_path)
+
+                async with STATE_LOCK:
+                    board = AGENTS.get(agent_id)
+                    if board:
+                        if copied:
+                            _append_log(board, f"ENV_SYNC - {', '.join(copied)}")
+                        if iterations is None:
+                            _append_log(board, f"RALPH_RUNNING - Script started in {worktree_path}")
+                        else:
+                            _append_log(
+                                board,
+                                f"RALPH_RUNNING - Script started in {worktree_path} ({iterations} iterations)",
+                            )
+
+                proc = await asyncio.create_subprocess_exec(
+                    "/bin/bash",
+                    str(RALPH_SCRIPT_PATH),
+                    *([str(iterations)] if iterations is not None else []),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=str(worktree_path),
+                )
+
+                if proc.stdout:
+                    while True:
+                        line = await proc.stdout.readline()
+                        if not line:
+                            break
+                        text = line.decode(errors="replace").rstrip()
+                        if not text:
+                            continue
+                        async with STATE_LOCK:
+                            board = AGENTS.get(agent_id)
+                            if not board:
+                                continue
+                            _append_log(board, text)
+
+                return_code = await proc.wait()
+
+                async with STATE_LOCK:
+                    board = AGENTS.get(agent_id)
+                    if not board:
+                        return
+                    _sync_board_from_prd(board)
+                    updated = board.tasks.get(task_id)
+                    if updated and not updated.passes and updated.status == "todo":
+                        _append_log(board, f"RALPH_REQUEUE - {task_id} still todo")
+                    _append_log(board, f"RALPH_DONE - {task_id} exit {return_code}")
+                    _set_agent_running(board, None)
     except Exception as exc:  # pragma: no cover
         async with STATE_LOCK:
-            _append_log(f"RALPH_ERROR - {exc.__class__.__name__}: {exc}")
-            _set_agent_waiting()
+            board = AGENTS.get(agent_id)
+            if not board:
+                return
+            _append_log(board, f"RALPH_ERROR - {exc.__class__.__name__}: {exc}")
+            _set_agent_waiting(board)
+    finally:
+        if proc and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 3)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+
+
+async def _openpr_worker_loop(agent_id: str, task_id: str) -> None:
+    proc: asyncio.subprocess.Process | None = None
+    workspace_path: Path | None = None
+    branch = ""
+    try:
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if not board:
+                return
+            task = board.tasks.get(task_id)
+            if not task:
+                _append_log(board, f"OPENPR_ERROR - Task not found {task_id}")
+                _set_agent_waiting(board)
+                return
+            if task.status != "review":
+                _append_log(board, f"OPENPR_ERROR - {task.id} not in review")
+                _set_agent_waiting(board)
+                return
+
+            workspace_path = _resolve_workspace_path(board)
+            if not workspace_path:
+                _append_log(board, "WORKSPACE_INVALID - Set a valid workspace path before starting.")
+                _set_agent_waiting(board)
+                return
+
+            branch = task.branch.strip() or _default_branch_for_task(task)
+            if branch != task.branch:
+                task.branch = branch
+                task.updated_at = _utc_now()
+                _append_log(board, f"BRANCH_SET - {task.id} {branch}")
+                _persist_prd()
+
+            _set_agent_running(board, task.id)
+            _append_log(board, f"OPENPR_START - {task.id} on {branch}")
+
+        repo_root = await asyncio.to_thread(_resolve_repo_root, workspace_path)
+        if not repo_root:
+            async with STATE_LOCK:
+                board = AGENTS.get(agent_id)
+                if not board:
+                    return
+                _append_log(board, "WORKSPACE_INVALID - Not a git repository")
+                _set_agent_waiting(board)
+            return
+
+        worktree_path, error = await _ensure_worktree_path(repo_root, branch)
+        if not worktree_path:
+            async with STATE_LOCK:
+                board = AGENTS.get(agent_id)
+                if not board:
+                    return
+                _append_log(board, f"WORKTREE_ERROR - {error}")
+                _set_agent_waiting(board)
+            return
+
+        copied = _copy_env_files(repo_root, worktree_path)
+        prompt_text, prompt_path = _resolve_codex_prompt("openpr")
+        if not prompt_text:
+            prompt_text = "/prompts:openpr"
+
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if board:
+                if copied:
+                    _append_log(board, f"ENV_SYNC - {', '.join(copied)}")
+                _append_log(board, f"OPENPR_RUNNING - {task_id} in {worktree_path}")
+                if prompt_path:
+                    _append_log(board, f"OPENPR_PROMPT - {prompt_path}")
+                else:
+                    _append_log(board, "OPENPR_PROMPT - /prompts:openpr")
+
+        proc = await asyncio.create_subprocess_exec(
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-m",
+            "gpt-5.2-codex",
+            "-c",
+            'model_reasoning_effort="xhigh"',
+            "--add-dir",
+            str(ROOT_DIR),
+            prompt_text,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(worktree_path),
+        )
+
+        if proc.stdout:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode(errors="replace").rstrip()
+                if not text:
+                    continue
+                async with STATE_LOCK:
+                    board = AGENTS.get(agent_id)
+                    if not board:
+                        continue
+                    _append_log(board, text)
+
+        return_code = await proc.wait()
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if not board:
+                return
+            _sync_board_from_prd(board)
+            _set_agent_waiting(board)
+            _append_log(board, f"OPENPR_DONE - {task_id} exit {return_code}")
+    except Exception as exc:  # pragma: no cover
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if not board:
+                return
+            _append_log(board, f"OPENPR_ERROR - {exc.__class__.__name__}: {exc}")
+            _set_agent_waiting(board)
+    finally:
+        if proc and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 3)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
 
 
 _load_prd_state()
@@ -458,30 +1076,54 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/api/state", response_model=BoardStateResponse)
-async def get_state() -> BoardStateResponse:
+@app.get("/api/agents", response_model=AgentsResponse)
+async def list_agents() -> AgentsResponse:
     async with STATE_LOCK:
-        return _board_state_response()
+        agents = [_agent_to_summary(AGENTS[agent_id]) for agent_id in AGENT_ORDER if agent_id in AGENTS]
+        return AgentsResponse(agents=agents)
+
+
+@app.post("/api/agents", response_model=AgentSummary)
+async def create_agent(payload: CreateAgentRequest | None = None) -> AgentSummary:
+    async with STATE_LOCK:
+        _ensure_mutation_allowed()
+        name = payload.name.strip() if payload and payload.name else ""
+        agent_id = _next_agent_id()
+        if not name:
+            name = _default_agent_name(_extract_agent_sequence(agent_id) or len(AGENT_ORDER) + 1)
+
+        board = _create_board(agent_id, name, DEFAULT_BRANCH_NAME, "", [])
+        AGENTS[agent_id] = board
+        AGENT_ORDER.append(agent_id)
+        _persist_prd()
+        return _agent_to_summary(board)
+
+
+@app.get("/api/state", response_model=BoardStateResponse)
+async def get_state(agent_id: str | None = None) -> BoardStateResponse:
+    async with STATE_LOCK:
+        board = _get_board(agent_id)
+        return _board_state_response(board)
 
 
 @app.post("/api/workspace", response_model=BoardStateResponse)
-async def update_workspace(payload: WorkspaceRequest) -> BoardStateResponse:
-    global WORKSPACE_PATH
-
+async def update_workspace(payload: WorkspaceRequest, agent_id: str | None = None) -> BoardStateResponse:
     path = payload.path.strip()
     if not path:
         raise HTTPException(status_code=400, detail="Workspace path is required")
 
     async with STATE_LOCK:
-        if path != WORKSPACE_PATH:
-            WORKSPACE_PATH = path
-            _append_log(f"WORKSPACE_SET - {path}")
+        _ensure_mutation_allowed()
+        board = _get_board(agent_id)
+        if path != board.workspace_path:
+            board.workspace_path = path
+            _append_log(board, f"WORKSPACE_SET - {path}")
             _persist_prd()
-        return _board_state_response()
+        return _board_state_response(board)
 
 
 @app.post("/api/tasks", response_model=TaskResponse)
-async def create_task(payload: CreateTaskRequest) -> TaskResponse:
+async def create_task(payload: CreateTaskRequest, agent_id: str | None = None) -> TaskResponse:
     title = payload.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="Title is required")
@@ -489,9 +1131,17 @@ async def create_task(payload: CreateTaskRequest) -> TaskResponse:
     acceptance_criteria = _normalize_acceptance(payload.acceptance_criteria)
 
     async with STATE_LOCK:
-        task_id = _generate_story_id()
+        _ensure_mutation_allowed()
+        board = _get_board(agent_id)
+        task_id = _generate_story_id(board)
 
         now = _utc_now()
+        status = payload.status
+        if status == "done":
+            status = "review"
+        if payload.passes and status != "done":
+            status = "review"
+
         task = TaskState(
             id=task_id,
             title=title,
@@ -499,7 +1149,7 @@ async def create_task(payload: CreateTaskRequest) -> TaskResponse:
             priority=payload.priority,
             passes=payload.passes,
             notes=payload.notes.strip(),
-            status=payload.status,
+            status=status,
             owner="",
             effort="",
             branch="",
@@ -507,17 +1157,19 @@ async def create_task(payload: CreateTaskRequest) -> TaskResponse:
             summary="",
             updated_at=now,
         )
-        TASKS[task_id] = task
-        TASK_ORDER.append(task_id)
-        _append_log(f"TASK_CREATED - {task_id} {title}")
+        board.tasks[task_id] = task
+        board.order.append(task_id)
+        _append_log(board, f"TASK_CREATED - {task_id} {title}")
         _persist_prd()
         return _task_to_response(task)
 
 
 @app.patch("/api/tasks/{task_id}", response_model=TaskResponse)
-async def update_task(task_id: str, payload: UpdateTaskRequest) -> TaskResponse:
+async def update_task(task_id: str, payload: UpdateTaskRequest, agent_id: str | None = None) -> TaskResponse:
     async with STATE_LOCK:
-        task = TASKS.get(task_id)
+        _ensure_mutation_allowed()
+        board = _get_board(agent_id)
+        task = board.tasks.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
 
@@ -541,24 +1193,48 @@ async def update_task(task_id: str, payload: UpdateTaskRequest) -> TaskResponse:
 
         if payload.status is not None:
             previous_status = task.status
-            task.status = payload.status
-            if payload.status == "ready" and previous_status != "ready":
-                _append_log(f"QUEUE_READY - {task.id} queued for Ralph")
-            elif previous_status != payload.status:
-                _append_log(f"STATUS_CHANGE - {task.id} {previous_status} -> {payload.status}")
+            next_status = payload.status
+            if next_status == "done":
+                next_status = "review"
+                _append_log(board, f"STATUS_AUTO - {task.id} done -> review")
 
-            if payload.status != "active" and AGENT.current_task_id == task.id:
-                _set_agent_running(None)
+            task.status = next_status
+            if previous_status != next_status:
+                _append_log(board, f"STATUS_CHANGE - {task.id} {previous_status} -> {next_status}")
 
+        if payload.passes is True and task.status != "done":
+            if task.status != "review":
+                _append_log(board, f"STATUS_AUTO - {task.id} passes -> review")
+            task.status = "review"
         task.updated_at = _utc_now()
         _persist_prd()
         return _task_to_response(task)
 
 
-@app.post("/api/tasks/{task_id}/review", response_model=TaskResponse)
-async def review_task(task_id: str, payload: ReviewRequest) -> TaskResponse:
+@app.delete("/api/tasks/{task_id}", response_model=TaskResponse)
+async def delete_task(task_id: str, agent_id: str | None = None) -> TaskResponse:
     async with STATE_LOCK:
-        task = TASKS.get(task_id)
+        _ensure_mutation_allowed()
+        board = _get_board(agent_id)
+        task = board.tasks.pop(task_id, None)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        board.order = [item for item in board.order if item != task_id]
+        if board.agent.current_task_id == task_id:
+            _set_agent_waiting(board)
+
+        _append_log(board, f"TASK_DELETED - {task.id} {task.title}")
+        _persist_prd()
+        return _task_to_response(task)
+
+
+@app.post("/api/tasks/{task_id}/review", response_model=TaskResponse)
+async def review_task(task_id: str, payload: ReviewRequest, agent_id: str | None = None) -> TaskResponse:
+    async with STATE_LOCK:
+        _ensure_mutation_allowed()
+        board = _get_board(agent_id)
+        task = board.tasks.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
         if task.status != "review":
@@ -567,47 +1243,146 @@ async def review_task(task_id: str, payload: ReviewRequest) -> TaskResponse:
         if payload.decision == "approved":
             task.status = "done"
             task.passes = True
-            _append_log(f"REVIEW_APPROVED - {task.id} moved to done")
+            _append_log(board, f"REVIEW_APPROVED - {task.id} moved to done")
         else:
-            task.status = "backlog"
+            task.status = "todo"
             task.passes = False
-            _append_log(f"REVIEW_REJECTED - {task.id} returned to backlog")
+            _append_log(board, f"REVIEW_REJECTED - {task.id} returned to todo")
 
         task.updated_at = _utc_now()
         _persist_prd()
         return _task_to_response(task)
 
 
-@app.post("/api/ralph/start", response_model=BoardStateResponse)
-async def start_ralph() -> BoardStateResponse:
-    global RALPH_WORKER
+@app.post("/api/tasks/{task_id}/codex", response_model=BoardStateResponse)
+async def open_task_codex(task_id: str, agent_id: str | None = None) -> BoardStateResponse:
+    async with STATE_LOCK:
+        _ensure_mutation_allowed()
+        board = _get_board(agent_id)
+        if board.worker and not board.worker.done():
+            raise HTTPException(status_code=409, detail="Ralph is running")
+
+        task = board.tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task.status != "review":
+            raise HTTPException(status_code=409, detail="Task is not in review")
+
+        workspace_path = _resolve_workspace_path(board)
+        if not workspace_path:
+            raise HTTPException(status_code=400, detail="Workspace path is required")
+
+        branch = task.branch.strip() or _default_branch_for_task(task)
+        if branch != task.branch:
+            task.branch = branch
+            task.updated_at = _utc_now()
+            _append_log(board, f"BRANCH_SET - {task.id} {branch}")
+            _persist_prd()
+
+    repo_root = await asyncio.to_thread(_resolve_repo_root, workspace_path)
+    if not repo_root:
+        async with STATE_LOCK:
+            board = _get_board(agent_id)
+            _append_log(board, "WORKSPACE_INVALID - Not a git repository")
+            return _board_state_response(board)
+
+    worktree_path, error = await _ensure_worktree_path(repo_root, branch)
+    if not worktree_path:
+        async with STATE_LOCK:
+            board = _get_board(agent_id)
+            _append_log(board, f"WORKTREE_ERROR - {error}")
+            return _board_state_response(board)
+
+    copied = _copy_env_files(repo_root, worktree_path)
+    success, message = _launch_codex_terminal(worktree_path)
 
     async with STATE_LOCK:
-        if RALPH_WORKER and not RALPH_WORKER.done():
-            return _board_state_response()
+        board = _get_board(agent_id)
+        if copied:
+            _append_log(board, f"ENV_SYNC - {', '.join(copied)}")
+        if success:
+            _append_log(board, f"CODEX_OPEN - {task_id} in {worktree_path}")
+        else:
+            _append_log(board, f"CODEX_ERROR - {message}")
+        return _board_state_response(board)
 
-        _append_log("RALPH_START - Requested")
-        RALPH_WORKER = asyncio.create_task(_ralph_worker_loop())
-        return _board_state_response()
+
+@app.post("/api/tasks/{task_id}/openpr", response_model=BoardStateResponse)
+async def open_task_pr(task_id: str, agent_id: str | None = None) -> BoardStateResponse:
+    async with STATE_LOCK:
+        _ensure_mutation_allowed()
+        board = _get_board(agent_id)
+        if board.worker and not board.worker.done():
+            raise HTTPException(status_code=409, detail="Ralph is running")
+
+        task = board.tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task.status != "review":
+            raise HTTPException(status_code=409, detail="Task is not in review")
+
+        _append_log(board, f"OPENPR_REQUEST - {task.id}")
+        _start_openpr_worker(board, task.id)
+        return _board_state_response(board)
+
+
+@app.post("/api/ralph/start", response_model=BoardStateResponse)
+async def start_ralph(
+    payload: StartRalphRequest | None = None,
+    agent_id: str | None = None,
+) -> BoardStateResponse:
+    async with STATE_LOCK:
+        if not RALPH_SCRIPT_PATH.exists():
+            raise HTTPException(status_code=500, detail="ralph.sh not found")
+
+        board = _get_board(agent_id)
+        if not _resolve_workspace_path(board):
+            _append_log(board, "WORKSPACE_INVALID - Set a valid workspace path before starting.")
+            _set_agent_waiting(board)
+            return _board_state_response(board)
+        if board.worker and not board.worker.done():
+            return _board_state_response(board)
+
+        _append_log(board, "RALPH_START - Requested")
+        _start_worker(board, payload.iterations if payload else None)
+        return _board_state_response(board)
 
 
 @app.post("/api/agents/start-all", response_model=BoardStateResponse)
-async def start_all_agents() -> BoardStateResponse:
+async def start_all_agents(
+    payload: StartRalphRequest | None = None,
+    agent_id: str | None = None,
+) -> BoardStateResponse:
     async with STATE_LOCK:
-        _append_log("AGENTS_START_ALL - Requested (stub)")
-        return _board_state_response()
+        if not RALPH_SCRIPT_PATH.exists():
+            raise HTTPException(status_code=500, detail="ralph.sh not found")
+
+        for board in AGENTS.values():
+            if board.worker and not board.worker.done():
+                continue
+            if not _resolve_workspace_path(board):
+                _append_log(board, "WORKSPACE_INVALID - Set a valid workspace path before starting.")
+                _set_agent_waiting(board)
+                continue
+            _append_log(board, "AGENTS_START_ALL - Requested")
+            _start_worker(board, payload.iterations if payload else None)
+
+        board = _get_board(agent_id)
+        return _board_state_response(board)
 
 
 @app.post("/api/pull-latest", response_model=BoardStateResponse)
-async def pull_latest() -> BoardStateResponse:
+async def pull_latest(agent_id: str | None = None) -> BoardStateResponse:
     async with STATE_LOCK:
-        _append_log("PULL_LATEST - Requested (stub)")
-        return _board_state_response()
+        board = _get_board(agent_id)
+        _append_log(board, "PULL_LATEST - Requested (stub)")
+        return _board_state_response(board)
 
 
 @app.post("/api/logs/clear", response_model=BoardStateResponse)
-async def clear_logs() -> BoardStateResponse:
+async def clear_logs(agent_id: str | None = None) -> BoardStateResponse:
     async with STATE_LOCK:
-        LOGS.clear()
-        _append_log("LOGS_CLEARED")
-        return _board_state_response()
+        board = _get_board(agent_id)
+        board.logs.clear()
+        _append_log(board, "LOGS_CLEARED")
+        return _board_state_response(board)
