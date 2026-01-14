@@ -1,0 +1,23 @@
+{
+  "branchName": "ralph/feature",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add login form",
+      "acceptanceCriteria": [
+        "Email/password fields",
+        "Validates email format",
+        "typecheck passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": "",
+      "status": "backlog",
+      "owner": "",
+      "effort": "",
+      "branch": "",
+      "commit": "",
+      "summary": ""
+    }
+  ]
+}
