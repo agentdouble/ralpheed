@@ -100,6 +100,7 @@ class BoardStateResponse(BaseModel):
     agent: AgentResponse
     tasks: list[TaskResponse]
     logs: list[str]
+    workspace_path: str
 
 
 class CreateTaskRequest(BaseModel):
@@ -124,10 +125,15 @@ class ReviewRequest(BaseModel):
     decision: ReviewDecision
 
 
+class WorkspaceRequest(BaseModel):
+    path: str = Field(default="", max_length=512)
+
+
 TASKS: dict[str, TaskState] = {}
 TASK_ORDER: list[str] = []
 TASK_SEQUENCE = 1
 BRANCH_NAME = DEFAULT_BRANCH_NAME
+WORKSPACE_PATH = ""
 
 STATE_LOCK = asyncio.Lock()
 RALPH_WORKER: asyncio.Task[None] | None = None
@@ -212,7 +218,7 @@ def _extract_sequence(task_id: str) -> int:
 
 def _read_prd() -> dict[str, object]:
     if not PRD_PATH.exists():
-        return {"branchName": DEFAULT_BRANCH_NAME, "userStories": []}
+        return {"branchName": DEFAULT_BRANCH_NAME, "workspacePath": "", "userStories": []}
     return json.loads(PRD_PATH.read_text(encoding="utf-8"))
 
 
@@ -249,16 +255,18 @@ def _persist_prd() -> None:
         task = TASKS.get(task_id)
         if task:
             stories.append(_task_to_story(task))
-    data = {"branchName": BRANCH_NAME, "userStories": stories}
+    data = {"branchName": BRANCH_NAME, "workspacePath": WORKSPACE_PATH, "userStories": stories}
     _write_prd(data)
 
 
 def _load_prd_state() -> None:
-    global BRANCH_NAME, TASKS, TASK_ORDER, TASK_SEQUENCE
+    global BRANCH_NAME, TASKS, TASK_ORDER, TASK_SEQUENCE, WORKSPACE_PATH
 
     data = _read_prd()
     branch = data.get("branchName")
     BRANCH_NAME = branch if isinstance(branch, str) and branch.strip() else DEFAULT_BRANCH_NAME
+    workspace_path = data.get("workspacePath")
+    WORKSPACE_PATH = workspace_path if isinstance(workspace_path, str) else ""
 
     stories = data.get("userStories")
     if not isinstance(stories, list):
@@ -343,6 +351,7 @@ def _board_state_response() -> BoardStateResponse:
         agent=_agent_to_response(),
         tasks=[_task_to_response(task) for task in tasks],
         logs=list(LOGS),
+        workspace_path=WORKSPACE_PATH,
     )
 
 
@@ -452,6 +461,22 @@ def health() -> dict[str, str]:
 @app.get("/api/state", response_model=BoardStateResponse)
 async def get_state() -> BoardStateResponse:
     async with STATE_LOCK:
+        return _board_state_response()
+
+
+@app.post("/api/workspace", response_model=BoardStateResponse)
+async def update_workspace(payload: WorkspaceRequest) -> BoardStateResponse:
+    global WORKSPACE_PATH
+
+    path = payload.path.strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="Workspace path is required")
+
+    async with STATE_LOCK:
+        if path != WORKSPACE_PATH:
+            WORKSPACE_PATH = path
+            _append_log(f"WORKSPACE_SET - {path}")
+            _persist_prd()
         return _board_state_response()
 
 
