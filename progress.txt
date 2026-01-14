@@ -4,8 +4,49 @@ Started: 2024-01-15
 ## Codebase Patterns
 - Migrations: IF NOT EXISTS
 - Types: Export from actions.ts
+- Python: Ignore .venv/ and __pycache__/ when using uv run
 
 ## Key Files
 - db/schema.ts
 - app/auth/actions.ts
+---
+
+## 2026-01-14 - US-002
+- Added a minimal Python utility with a coucou() function and tests.
+- Files changed: coucou.py, tests/test_coucou.py, pyproject.toml, README.md, .gitignore, uv.lock
+- **Learnings:**
+  - Patterns discovered: none.
+  - Gotchas encountered: uv run creates local venv/cache artifacts; keep them ignored.
+---
+
+## 2026-01-14 - US-001
+- Added a Tkinter login form with email/password fields and email validation.
+- Files changed: main.py, login_form.py, tests/test_login_form.py, README.md, .gitignore, uv.lock.
+- **Learnings:**
+  - Patterns discovered: none.
+  - Gotchas encountered: uv run creates .venv and __pycache__; keep them ignored.
+---
+
+## 2026-01-15 - US-002
+- Changed the snake body color to violet and updated docs/tests.
+- Files changed: snake.py, test_snake_color.py, README.md
+- **Learnings:**
+  - Patterns discovered: none.
+  - Gotchas encountered: none.
+---
+
+## 2026-01-15 - US-002
+- Changed the snake color to orange and aligned docs/tests.
+- Files changed: snake.py, test_snake_color.py, README.md
+- **Learnings:**
+  - Patterns discovered: none.
+  - Gotchas encountered: none.
+---
+
+## 2026-01-15 - US-003
+- Added a white background and adjusted HUD text colors for contrast.
+- Files changed: snake.py, README.md
+- **Learnings:**
+  - Patterns discovered: none.
+  - Gotchas encountered: `python -m unittest` exits non-zero when no tests are collected.
 ---

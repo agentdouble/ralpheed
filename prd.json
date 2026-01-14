@@ -1,23 +1,51 @@
 {
-  "branchName": "ralph/feature",
-  "userStories": [
+  "agents": [
     {
-      "id": "US-001",
-      "title": "Add login form",
-      "acceptanceCriteria": [
-        "Email/password fields",
-        "Validates email format",
-        "typecheck passes"
-      ],
-      "priority": 1,
-      "passes": false,
-      "notes": "",
-      "status": "backlog",
-      "owner": "",
-      "effort": "",
-      "branch": "",
-      "commit": "",
-      "summary": ""
+      "id": "agent-1",
+      "name": "Ralph",
+      "branchName": "ralph/feature",
+      "workspacePath": "/Users/rekta/projet/sand/test",
+      "userStories": [
+        {
+          "id": "US-002",
+          "title": "change la couleur du serpent orange",
+          "acceptanceCriteria": [
+            "serpent couleur orange"
+          ],
+          "priority": 1,
+          "passes": true,
+          "notes": "en python",
+          "status": "review",
+          "owner": "Ralph",
+          "effort": "2d",
+          "branch": "feat/us-002-f592",
+          "commit": "a49b3e3",
+          "summary": "Auto-filled by Ralph."
+        },
+        {
+          "id": "US-003",
+          "title": "ajouter un background blanc",
+          "acceptanceCriteria": [
+            "ajouter un background blanc"
+          ],
+          "priority": 2,
+          "passes": true,
+          "notes": "",
+          "status": "todo",
+          "owner": "",
+          "effort": "",
+          "branch": "feat/us-003",
+          "commit": "",
+          "summary": ""
+        }
+      ]
+    },
+    {
+      "id": "agent-2",
+      "name": "Ralph 2",
+      "branchName": "ralph/feature",
+      "workspacePath": "",
+      "userStories": []
     }
   ]
 }

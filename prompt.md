@@ -4,23 +4,24 @@ markdown
 
 ## Your Task
 
-1. Read `AGENTS.md`
-2. Read `prd.json`
-3. Read `progress.txt`
+1. Read `{{CONTROL_ROOT}}/AGENTS.md`
+2. Read `{{CONTROL_ROOT}}/prd.json`
+3. Read `{{CONTROL_ROOT}}/progress.txt`
    (check Codebase Patterns first)
-4. Check you're on the correct branch
-5. Pick highest priority story 
+4. Work in the current repo (workspace path)
+5. Check you're on the correct branch
+6. Pick highest priority story 
    where `passes: false`
-6. Implement that ONE story
-7. Run typecheck and tests
-8. Update AGENTS.md files with learnings
-9. Commit: `feat: [ID] - [Title]`
-10. Update prd.json: `passes: true`
-11. Append learnings to progress.txt
+7. Implement that ONE story
+8. Run typecheck and tests
+9. Update `{{CONTROL_ROOT}}/AGENTS.md` with learnings if needed
+10. Commit: `feat: [ID] - [Title]`
+11. Update `{{CONTROL_ROOT}}/prd.json`: `passes: true`
+12. Append learnings to `{{CONTROL_ROOT}}/progress.txt`
 
 ## Progress Format
 
-APPEND to progress.txt:
+APPEND to {{CONTROL_ROOT}}/progress.txt:
 
 ## [Date] - [Story ID]
 - What was implemented

@@ -9,10 +9,14 @@ echo "🚀 Starting Ralph"
 
 for i in $(seq 1 $MAX_ITERATIONS); do
   echo "═══ Iteration $i ═══"
-  
-  OUTPUT=$(codex exec --skip-git-repo-check -m gpt-5.2-codex \
+
+  PROMPT_TEMPLATE="$(cat "$SCRIPT_DIR/prompt.md")"
+  PROMPT="$(printf "%s" "$PROMPT_TEMPLATE" | sed "s|{{CONTROL_ROOT}}|$SCRIPT_DIR|g")"
+
+  OUTPUT=$(codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -m gpt-5.2-codex \
     -c model_reasoning_effort="xhigh" \
-    "$(cat "$SCRIPT_DIR/prompt.md")" 2>&1 \
+    --add-dir "$SCRIPT_DIR" \
+    "$PROMPT" 2>&1 \
     | tee /dev/stderr) || true
   
   if echo "$OUTPUT" | \

@@ -5,14 +5,13 @@ const DEFAULT_API_URL = 'http://127.0.0.1:8000'
 
 const COLUMNS = [
   { id: 'backlog', label: 'Backlog' },
-  { id: 'plan', label: 'Plan' },
-  { id: 'ready', label: 'Ready' },
-  { id: 'active', label: 'Active' },
+  { id: 'todo', label: 'Todo' },
   { id: 'review', label: 'Review' },
   { id: 'done', label: 'Done' },
 ]
 
-const QUICK_COLUMNS = new Set(['backlog', 'plan', 'ready'])
+const QUICK_COLUMNS = new Set(['backlog'])
+const DEFAULT_QUICK_TITLES = { backlog: '' }
 
 const clampPriority = (value) => {
   const parsed = Number(value)
@@ -33,6 +32,21 @@ const parseAcceptanceCriteria = (text) => {
     .split('\n')
     .map((item) => item.trim())
     .filter(Boolean)
+}
+
+const normalizeStatus = (status) => {
+  if (status === 'backlog' || status === 'todo' || status === 'review' || status === 'done') {
+    return status
+  }
+  if (status === 'plan' || status === 'ready' || status === 'active') {
+    return 'todo'
+  }
+  return 'backlog'
+}
+
+const formatAcceptanceCriteria = (criteria) => {
+  if (!Array.isArray(criteria)) return ''
+  return criteria.join('\n')
 }
 
 const formatClock = (value) => {
@@ -63,7 +77,25 @@ const mergeSet = (prev, value, enabled) => {
   return next
 }
 
-const TaskCard = ({ task, draggable, isPending, onDragStart, onReview }) => {
+const parseIterations = (value) => {
+  const raw = String(value ?? '').trim()
+  if (!raw) return null
+  const parsed = Number.parseInt(raw, 10)
+  if (Number.isNaN(parsed) || parsed < 1) return undefined
+  return parsed
+}
+
+const TaskCard = ({
+  task,
+  draggable,
+  isPending,
+  onDragStart,
+  onReview,
+  onEdit,
+  onDelete,
+  onCodex,
+  onOpenPr,
+}) => {
   const priorityValue = clampPriority(task.priority)
   const tone = priorityTone(priorityValue)
   const criteria = Array.isArray(task.acceptance_criteria) ? task.acceptance_criteria : []
@@ -72,7 +104,9 @@ const TaskCard = ({ task, draggable, isPending, onDragStart, onReview }) => {
 
   return (
     <article
-      className={`board-task ${draggable ? 'board-task--draggable' : ''} ${isPending ? 'board-task--pending' : ''}`}
+      className={`board-task ${draggable ? 'board-task--draggable' : ''} ${
+        isPending ? 'board-task--pending' : ''
+      }`}
       draggable={draggable && !isPending}
       onDragStart={draggable ? (event) => onDragStart(event, task.id) : undefined}
     >
@@ -103,25 +137,64 @@ const TaskCard = ({ task, draggable, isPending, onDragStart, onReview }) => {
       </div>
 
       {task.status === 'review' ? (
-        <div className="task-actions">
-          <button
-            className="chip-button chip-button--approve"
-            type="button"
-            onClick={() => onReview(task.id, 'approved')}
-            disabled={isPending}
-          >
-            Approve
-          </button>
-          <button
-            className="chip-button chip-button--reject"
-            type="button"
-            onClick={() => onReview(task.id, 'rejected')}
-            disabled={isPending}
-          >
-            Reject
-          </button>
-        </div>
+        <>
+          <div className="task-actions">
+            <button
+              className="chip-button chip-button--approve"
+              type="button"
+              onClick={() => onReview(task.id, 'approved')}
+              disabled={isPending}
+            >
+              Approve
+            </button>
+            <button
+              className="chip-button chip-button--reject"
+              type="button"
+              onClick={() => onReview(task.id, 'rejected')}
+              disabled={isPending}
+            >
+              Reject
+            </button>
+          </div>
+          <div className="task-actions task-actions--review">
+            <button
+              className="chip-button chip-button--codex"
+              type="button"
+              onClick={() => onCodex(task.id)}
+              disabled={isPending}
+            >
+              Codex
+            </button>
+            <button
+              className="chip-button chip-button--openpr"
+              type="button"
+              onClick={() => onOpenPr(task.id)}
+              disabled={isPending}
+            >
+              openPR
+            </button>
+          </div>
+        </>
       ) : null}
+
+      <div className="task-actions task-actions--secondary">
+        <button
+          className="chip-button chip-button--edit"
+          type="button"
+          onClick={() => onEdit(task)}
+          disabled={isPending}
+        >
+          Edit
+        </button>
+        <button
+          className="chip-button chip-button--delete"
+          type="button"
+          onClick={() => onDelete(task.id)}
+          disabled={isPending}
+        >
+          Delete
+        </button>
+      </div>
 
       {task.status === 'done' && task.summary ? (
         <div className="task-summary">
@@ -141,15 +214,14 @@ export default function App() {
 
   const [healthStatus, setHealthStatus] = useState('checking')
   const [board, setBoard] = useState(null)
+  const [agents, setAgents] = useState([])
+  const [activeAgentId, setActiveAgentId] = useState('')
   const [fetchError, setFetchError] = useState('')
   const [actionError, setActionError] = useState('')
 
   const [isAddOpen, setIsAddOpen] = useState(false)
-  const [quickTitleByColumn, setQuickTitleByColumn] = useState({
-    backlog: '',
-    plan: '',
-    ready: '',
-  })
+  const [editingTaskId, setEditingTaskId] = useState(null)
+  const [quickTitleByColumn, setQuickTitleByColumn] = useState(DEFAULT_QUICK_TITLES)
   const [creatingColumns, setCreatingColumns] = useState(new Set())
 
   const [newTitle, setNewTitle] = useState('')
@@ -158,15 +230,17 @@ export default function App() {
   const [newPasses, setNewPasses] = useState(false)
   const [newNotes, setNewNotes] = useState('')
   const [newStatus, setNewStatus] = useState('backlog')
-  const [isCreating, setIsCreating] = useState(false)
+  const [isSavingTask, setIsSavingTask] = useState(false)
 
-  const [isStartingRalph, setIsStartingRalph] = useState(false)
+  const [isStartingAgent, setIsStartingAgent] = useState(false)
   const [isPullingLatest, setIsPullingLatest] = useState(false)
   const [isClearingLogs, setIsClearingLogs] = useState(false)
   const [isExpandedLog, setIsExpandedLog] = useState(false)
   const [workspacePath, setWorkspacePath] = useState('')
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false)
   const [workspaceDirty, setWorkspaceDirty] = useState(false)
+  const [isCreatingAgent, setIsCreatingAgent] = useState(false)
+  const [iterationsInput, setIterationsInput] = useState('10')
 
   const [pendingTaskIds, setPendingTaskIds] = useState(new Set())
   const [dropTarget, setDropTarget] = useState(null)
@@ -174,11 +248,23 @@ export default function App() {
   const fetchVersionRef = useRef(0)
   const stateVersionRef = useRef(0)
   const actionsLockRef = useRef(false)
+  const activeAgentRef = useRef('')
+
+  const activeAgent = useMemo(
+    () => agents.find((item) => item.id === activeAgentId) ?? null,
+    [agents, activeAgentId]
+  )
 
   const tasks = board?.tasks ?? []
   const agent = board?.agent ?? null
   const logs = board?.logs ?? []
   const workspacePathFromBoard = board?.workspace_path ?? ''
+  const agentLabel = activeAgent?.name ?? agent?.name ?? 'Agent'
+  const isEditing = Boolean(editingTaskId)
+
+  useEffect(() => {
+    activeAgentRef.current = activeAgentId
+  }, [activeAgentId])
 
   const currentTask = useMemo(() => {
     if (!agent?.current_task_id) return null
@@ -189,7 +275,7 @@ export default function App() {
     const map = new Map()
     for (const column of COLUMNS) map.set(column.id, [])
     for (const task of tasks) {
-      const bucket = map.get(task.status) ?? map.get('backlog')
+      const bucket = map.get(normalizeStatus(task.status)) ?? map.get('backlog')
       bucket.push(task)
     }
     return map
@@ -198,40 +284,89 @@ export default function App() {
   const agentHeadline =
     agent?.status === 'running'
       ? currentTask
-        ? `Ralph: Working on ${currentTask.id}`
-        : 'Ralph: Running'
-      : 'Ralph: Waiting for tasks'
+        ? `${agentLabel}: Working on ${currentTask.id}`
+        : `${agentLabel}: Running`
+      : `${agentLabel}: Waiting for tasks`
+
+  const buildAgentUrl = (path, agentId) => {
+    const url = new URL(`${apiBaseUrl}${path}`)
+    if (agentId) url.searchParams.set('agent_id', agentId)
+    return url.toString()
+  }
 
   const bumpStateVersion = () => {
     stateVersionRef.current += 1
   }
 
-  const refreshState = async (signal) => {
+  const syncAgentsFromBoard = (data) => {
+    if (!data?.agent?.id) return
+    const snapshot = {
+      id: data.agent.id,
+      name: data.agent.name,
+      status: data.agent.status,
+      current_task_id: data.agent.current_task_id ?? null,
+    }
+    setAgents((prev) => {
+      const existing = prev.find((item) => item.id === snapshot.id)
+      if (!existing) {
+        return [...prev, snapshot]
+      }
+      return prev.map((item) => (item.id === snapshot.id ? { ...item, ...snapshot } : item))
+    })
+  }
+
+  const refreshState = async (agentId, signal) => {
+    if (!agentId) return null
     const version = fetchVersionRef.current + 1
     fetchVersionRef.current = version
     const guard = stateVersionRef.current
 
-    const res = await fetch(`${apiBaseUrl}/api/state`, { signal })
+    const res = await fetch(buildAgentUrl('/api/state', agentId), { signal })
     if (!res.ok) throw new Error(`State fetch failed (${res.status})`)
     const data = await res.json()
-    if (fetchVersionRef.current === version && stateVersionRef.current === guard) {
+    if (
+      fetchVersionRef.current === version &&
+      stateVersionRef.current === guard &&
+      activeAgentRef.current === agentId
+    ) {
       setBoard(data)
+      syncAgentsFromBoard(data)
       setFetchError('')
       setHealthStatus('online')
     }
     return data
   }
 
+  const loadAgents = async (signal) => {
+    const res = await fetch(`${apiBaseUrl}/api/agents`, { signal })
+    if (!res.ok) throw new Error(`Agents fetch failed (${res.status})`)
+    const data = await res.json()
+    const nextAgents = Array.isArray(data?.agents) ? data.agents : []
+    setAgents(nextAgents)
+    if (nextAgents.length === 0) {
+      setActiveAgentId('')
+      setBoard(null)
+      return nextAgents
+    }
+    setActiveAgentId((prev) => {
+      if (prev && nextAgents.some((item) => item.id === prev)) return prev
+      return nextAgents[0].id
+    })
+    return nextAgents
+  }
+
   useEffect(() => {
-    let timerId
     const controller = new AbortController()
     let active = true
+    let timerId
 
     const tick = async () => {
       try {
-        const data = await refreshState(controller.signal)
-        const nextDelay = data?.agent?.status === 'running' ? 1200 : 2800
-        if (active) timerId = window.setTimeout(tick, nextDelay)
+        await loadAgents(controller.signal)
+        if (active) {
+          setFetchError('')
+          setHealthStatus('online')
+        }
       } catch (error) {
         if (!controller.signal.aborted) {
           setFetchError('Unable to reach the API. Start the backend and try again.')
@@ -250,10 +385,62 @@ export default function App() {
   }, [apiBaseUrl])
 
   useEffect(() => {
+    if (!activeAgentId) return
+    let timerId
+    const controller = new AbortController()
+    let active = true
+
+    const tick = async () => {
+      try {
+        const data = await refreshState(activeAgentId, controller.signal)
+        const nextDelay = data?.agent?.status === 'running' ? 1200 : 2800
+        if (active) timerId = window.setTimeout(tick, nextDelay)
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setFetchError('Unable to reach the API. Start the backend and try again.')
+          setHealthStatus('offline')
+          if (active) timerId = window.setTimeout(tick, 3200)
+        }
+      }
+    }
+
+    tick()
+    return () => {
+      active = false
+      controller.abort()
+      window.clearTimeout(timerId)
+    }
+  }, [apiBaseUrl, activeAgentId])
+
+  useEffect(() => {
     if (!workspaceDirty && workspacePathFromBoard !== workspacePath) {
       setWorkspacePath(workspacePathFromBoard)
     }
   }, [workspaceDirty, workspacePath, workspacePathFromBoard])
+
+  useEffect(() => {
+    setBoard(null)
+    setIsAddOpen(false)
+    setEditingTaskId(null)
+    setQuickTitleByColumn({ ...DEFAULT_QUICK_TITLES })
+    setCreatingColumns(new Set())
+    setNewTitle('')
+    setNewAcceptanceText('')
+    setNewPriority('1')
+    setNewPasses(false)
+    setNewNotes('')
+    setNewStatus('backlog')
+    setIsSavingTask(false)
+    setIsStartingAgent(false)
+    setIsPullingLatest(false)
+    setIsClearingLogs(false)
+    setIsSavingWorkspace(false)
+    setWorkspacePath('')
+    setWorkspaceDirty(false)
+    setPendingTaskIds(new Set())
+    setDropTarget(null)
+    setActionError('')
+  }, [activeAgentId])
 
   const resetModalFields = (status = 'backlog') => {
     setNewTitle('')
@@ -266,10 +453,12 @@ export default function App() {
 
   const closeModal = () => {
     setIsAddOpen(false)
+    setEditingTaskId(null)
     resetModalFields('backlog')
   }
 
   const openModalForColumn = (status, seedTitle = '') => {
+    setEditingTaskId(null)
     resetModalFields(status)
     if (seedTitle) {
       setNewTitle(seedTitle)
@@ -277,7 +466,21 @@ export default function App() {
     setIsAddOpen(true)
   }
 
+  const openModalForEdit = (task) => {
+    setEditingTaskId(task.id)
+    setNewTitle(task.title ?? '')
+    setNewAcceptanceText(formatAcceptanceCriteria(task.acceptance_criteria))
+    setNewPriority(String(clampPriority(task.priority)))
+    setNewPasses(Boolean(task.passes))
+    setNewNotes(task.notes ?? '')
+    setNewStatus(normalizeStatus(task.status))
+    setIsAddOpen(true)
+    setActionError('')
+  }
+
   const createTask = async ({ title, acceptance_criteria, priority, passes, notes, status }) => {
+    if (!activeAgentId) throw new Error('No agent selected')
+    const requestAgentId = activeAgentId
     const payload = {
       title,
       acceptance_criteria,
@@ -287,7 +490,7 @@ export default function App() {
       status,
     }
 
-    const res = await fetch(`${apiBaseUrl}/api/tasks`, {
+    const res = await fetch(buildAgentUrl('/api/tasks', requestAgentId), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -299,19 +502,23 @@ export default function App() {
 
     const task = await res.json()
     bumpStateVersion()
+    if (activeAgentRef.current !== requestAgentId) return task
     setBoard((prev) => {
       const fallbackAgent = {
+        id: requestAgentId,
+        name: agentLabel,
         status: 'waiting',
         signal: 'RALPH_WAITING',
         last_update: new Date().toISOString(),
         current_task_id: null,
       }
 
-      if (!prev) {
+      if (!prev || prev.agent?.id !== requestAgentId) {
         return {
           agent: fallbackAgent,
           tasks: [task],
           logs: [],
+          workspace_path: '',
         }
       }
 
@@ -328,13 +535,15 @@ export default function App() {
     return task
   }
 
-  const safePost = async (path, body, setPending) => {
+  const safePost = async (path, body, setPending, agentId = activeAgentId) => {
+    if (!agentId) return null
     if (actionsLockRef.current) return null
+    const requestAgentId = agentId
     actionsLockRef.current = true
     setPending(true)
     setActionError('')
     try {
-      const res = await fetch(`${apiBaseUrl}${path}`, {
+      const res = await fetch(buildAgentUrl(path, requestAgentId), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: body ? JSON.stringify(body) : undefined,
@@ -342,7 +551,10 @@ export default function App() {
       if (!res.ok) throw new Error(`Request failed (${res.status})`)
       const data = await res.json()
       bumpStateVersion()
-      setBoard(data)
+      if (activeAgentRef.current === requestAgentId) {
+        setBoard(data)
+        syncAgentsFromBoard(data)
+      }
       return data
     } catch (error) {
       setActionError('Action failed. Try again.')
@@ -353,22 +565,53 @@ export default function App() {
     }
   }
 
-  const handleStartAll = async () => {
-    await safePost('/api/agents/start-all', null, () => {})
+  const handleAddAgent = async () => {
+    if (isCreatingAgent) return
+    setIsCreatingAgent(true)
+    setActionError('')
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/agents`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      if (!res.ok) throw new Error(`Create agent failed (${res.status})`)
+      const data = await res.json()
+      setAgents((prev) => [...prev, data])
+      setActiveAgentId(data.id)
+    } catch (error) {
+      setActionError('Unable to add agent. Try again.')
+    } finally {
+      setIsCreatingAgent(false)
+    }
   }
 
-  const handleStartRalph = async () => {
-    if (isStartingRalph) return
-    await safePost('/api/ralph/start', null, setIsStartingRalph)
+  const handleStartAll = async () => {
+    const iterations = parseIterations(iterationsInput)
+    if (iterations === undefined) {
+      setActionError('Iterations must be a positive number.')
+      return
+    }
+    await safePost('/api/agents/start-all', iterations === null ? null : { iterations }, () => {})
+  }
+
+  const handleStartAgent = async () => {
+    if (isStartingAgent || !activeAgentId) return
+    const iterations = parseIterations(iterationsInput)
+    if (iterations === undefined) {
+      setActionError('Iterations must be a positive number.')
+      return
+    }
+    await safePost('/api/ralph/start', iterations === null ? null : { iterations }, setIsStartingAgent)
   }
 
   const handlePullLatest = async () => {
-    if (isPullingLatest) return
+    if (isPullingLatest || !activeAgentId) return
     await safePost('/api/pull-latest', null, setIsPullingLatest)
   }
 
   const handleClearLogs = async () => {
-    if (isClearingLogs) return
+    if (isClearingLogs || !activeAgentId) return
     await safePost('/api/logs/clear', null, setIsClearingLogs)
   }
 
@@ -380,7 +623,7 @@ export default function App() {
 
   const handleWorkspaceSave = async (event) => {
     event.preventDefault()
-    if (isSavingWorkspace) return
+    if (isSavingWorkspace || !activeAgentId) return
     const trimmed = workspacePath.trim()
     if (!trimmed) return
     const data = await safePost('/api/workspace', { path: trimmed }, setIsSavingWorkspace)
@@ -391,7 +634,7 @@ export default function App() {
 
   const handleCreateTask = async (event) => {
     event.preventDefault()
-    if (isCreating) return
+    if (isSavingTask || !activeAgentId) return
 
     const title = newTitle.trim()
     if (!title) {
@@ -400,22 +643,28 @@ export default function App() {
     }
 
     const acceptance = parseAcceptanceCriteria(newAcceptanceText)
-    setIsCreating(true)
+    setIsSavingTask(true)
     setActionError('')
     try {
-      await createTask({
+      const payload = {
         title,
         acceptance_criteria: acceptance,
         priority: newPriority,
         passes: newPasses,
         notes: newNotes.trim(),
-        status: newStatus,
-      })
+        status: newStatus === 'done' ? 'review' : newStatus,
+      }
+
+      if (isEditing) {
+        await updateTask(editingTaskId, payload)
+      } else {
+        await createTask(payload)
+      }
       closeModal()
     } catch (error) {
-      setActionError('Unable to add task. Check the API and try again.')
+      setActionError(isEditing ? 'Unable to update task. Try again.' : 'Unable to add task. Check the API and try again.')
     } finally {
-      setIsCreating(false)
+      setIsSavingTask(false)
     }
   }
 
@@ -428,7 +677,7 @@ export default function App() {
 
   const handleQuickAdd = async (columnId) => {
     if (!QUICK_COLUMNS.has(columnId)) return
-    if (creatingColumns.has(columnId)) return
+    if (creatingColumns.has(columnId) || !activeAgentId) return
 
     const title = (quickTitleByColumn[columnId] || '').trim()
     if (!title) {
@@ -459,20 +708,23 @@ export default function App() {
   }
 
   const updateTask = async (taskId, patch) => {
-    if (!taskId) return
+    if (!taskId || !activeAgentId) return
+    const requestAgentId = activeAgentId
+    const nextPatch = patch?.status === 'done' ? { ...patch, status: 'review' } : patch
     setPendingTaskIds((prev) => mergeSet(prev, taskId, true))
     setActionError('')
     try {
-      const res = await fetch(`${apiBaseUrl}/api/tasks/${taskId}`, {
+      const res = await fetch(buildAgentUrl(`/api/tasks/${taskId}`, requestAgentId), {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch),
+        body: JSON.stringify(nextPatch),
       })
       if (!res.ok) throw new Error(`Update failed (${res.status})`)
       const updated = await res.json()
       bumpStateVersion()
+      if (activeAgentRef.current !== requestAgentId) return
       setBoard((prev) => {
-        if (!prev) return prev
+        if (!prev || prev.agent?.id !== requestAgentId) return prev
         return {
           ...prev,
           tasks: prev.tasks.map((task) => (task.id === updated.id ? updated : task)),
@@ -485,11 +737,77 @@ export default function App() {
     }
   }
 
-  const handleReview = async (taskId, decision) => {
+  const deleteTask = async (taskId) => {
+    if (!taskId || !activeAgentId) return
+    if (!window.confirm('Delete task?')) return
+    const requestAgentId = activeAgentId
     setPendingTaskIds((prev) => mergeSet(prev, taskId, true))
     setActionError('')
     try {
-      const res = await fetch(`${apiBaseUrl}/api/tasks/${taskId}/review`, {
+      const res = await fetch(buildAgentUrl(`/api/tasks/${taskId}`, requestAgentId), {
+        method: 'DELETE',
+      })
+      if (!res.ok) throw new Error(`Delete failed (${res.status})`)
+      await res.json()
+      bumpStateVersion()
+      if (activeAgentRef.current !== requestAgentId) return
+      setBoard((prev) => {
+        if (!prev || prev.agent?.id !== requestAgentId) return prev
+        const nextTasks = prev.tasks.filter((task) => task.id !== taskId)
+        const nextAgent =
+          prev.agent?.current_task_id === taskId
+            ? { ...prev.agent, current_task_id: null }
+            : prev.agent
+        return {
+          ...prev,
+          tasks: nextTasks,
+          agent: nextAgent,
+        }
+      })
+    } catch (error) {
+      setActionError('Unable to delete task. Try again.')
+    } finally {
+      setPendingTaskIds((prev) => mergeSet(prev, taskId, false))
+    }
+  }
+
+  const runTaskAction = async (taskId, action, errorMessage) => {
+    if (!taskId || !activeAgentId) return
+    const requestAgentId = activeAgentId
+    setPendingTaskIds((prev) => mergeSet(prev, taskId, true))
+    setActionError('')
+    try {
+      const res = await fetch(buildAgentUrl(`/api/tasks/${taskId}/${action}`, requestAgentId), {
+        method: 'POST',
+      })
+      if (!res.ok) throw new Error(`Request failed (${res.status})`)
+      const data = await res.json()
+      bumpStateVersion()
+      if (activeAgentRef.current !== requestAgentId) return
+      setBoard(data)
+      syncAgentsFromBoard(data)
+    } catch (error) {
+      setActionError(errorMessage)
+    } finally {
+      setPendingTaskIds((prev) => mergeSet(prev, taskId, false))
+    }
+  }
+
+  const handleCodex = async (taskId) => {
+    await runTaskAction(taskId, 'codex', 'Unable to open Codex. Try again.')
+  }
+
+  const handleOpenPr = async (taskId) => {
+    await runTaskAction(taskId, 'openpr', 'OpenPR failed. Try again.')
+  }
+
+  const handleReview = async (taskId, decision) => {
+    if (!activeAgentId) return
+    const requestAgentId = activeAgentId
+    setPendingTaskIds((prev) => mergeSet(prev, taskId, true))
+    setActionError('')
+    try {
+      const res = await fetch(buildAgentUrl(`/api/tasks/${taskId}/review`, requestAgentId), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ decision }),
@@ -497,8 +815,9 @@ export default function App() {
       if (!res.ok) throw new Error(`Review failed (${res.status})`)
       const updated = await res.json()
       bumpStateVersion()
+      if (activeAgentRef.current !== requestAgentId) return
       setBoard((prev) => {
-        if (!prev) return prev
+        if (!prev || prev.agent?.id !== requestAgentId) return prev
         return {
           ...prev,
           tasks: prev.tasks.map((task) => (task.id === updated.id ? updated : task)),
@@ -522,13 +841,20 @@ export default function App() {
     setDropTarget(null)
     const taskId = event.dataTransfer.getData('text/plain')
     const task = tasks.find((item) => item.id === taskId)
-    if (!task || task.status === status) return
-    await updateTask(taskId, { status })
+    if (!task) return
+    const currentStatus = normalizeStatus(task.status)
+    const targetStatus = status === 'done' ? 'review' : status
+    if (currentStatus === targetStatus) return
+    await updateTask(taskId, { status: targetStatus })
   }
 
   const hasWorkspacePath = workspacePath.trim().length > 0
   const canSaveWorkspace = workspaceDirty && hasWorkspacePath && !isSavingWorkspace
-  const workspaceButtonLabel = isSavingWorkspace ? 'Saving' : workspaceDirty || !hasWorkspacePath ? 'Save' : 'Saved'
+  const workspaceButtonLabel = isSavingWorkspace
+    ? 'Saving'
+    : workspaceDirty || !hasWorkspacePath
+      ? 'Save'
+      : 'Saved'
 
   return (
     <div className="app">
@@ -541,11 +867,39 @@ export default function App() {
           <button className="ghost-button" type="button" onClick={handlePullLatest} disabled={isPullingLatest}>
             Pull Latest
           </button>
-          <button className="primary-button" type="button" onClick={() => openModalForColumn('backlog')}>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={() => openModalForColumn('backlog')}
+            disabled={!activeAgentId}
+          >
             + Add Task
           </button>
         </div>
       </header>
+
+      <section className="agent-tabs" aria-label="Agents">
+        <div className="agent-tabs__list">
+          {agents.map((item) => (
+            <button
+              key={item.id}
+              className={`agent-tab ${item.id === activeAgentId ? 'agent-tab--active' : ''}`}
+              type="button"
+              onClick={() => setActiveAgentId(item.id)}
+            >
+              {item.name}
+            </button>
+          ))}
+        </div>
+        <button
+          className="ghost-button"
+          type="button"
+          onClick={handleAddAgent}
+          disabled={isCreatingAgent}
+        >
+          {isCreatingAgent ? 'Adding' : '+ Add Agent'}
+        </button>
+      </section>
 
       {fetchError ? <p className="callout callout--error">{fetchError}</p> : null}
       {actionError ? <p className="callout callout--error">{actionError}</p> : null}
@@ -557,16 +911,32 @@ export default function App() {
             <p className="agent-title">{agentHeadline}</p>
           </div>
           <div className="agent-actions">
+            <label className="agent-iterations">
+              <span>Iterations</span>
+              <input
+                type="number"
+                min="1"
+                inputMode="numeric"
+                value={iterationsInput}
+                onChange={(event) => setIterationsInput(event.target.value)}
+                placeholder="Default"
+                disabled={!activeAgentId}
+              />
+            </label>
             <button className="ghost-button ghost-button--inverse" type="button" onClick={handleStartAll}>
               Start All Agents
             </button>
             <button
               className="primary-button primary-button--inverse"
               type="button"
-              onClick={handleStartRalph}
-              disabled={isStartingRalph || agent?.status === 'running'}
+              onClick={handleStartAgent}
+              disabled={isStartingAgent || agent?.status === 'running' || !activeAgentId}
             >
-              {agent?.status === 'running' ? 'Ralph running' : isStartingRalph ? 'Starting...' : 'Start Ralph'}
+              {agent?.status === 'running'
+                ? `${agentLabel} running`
+                : isStartingAgent
+                  ? 'Starting...'
+                  : `Start ${agentLabel}`}
             </button>
           </div>
         </div>
@@ -584,7 +954,7 @@ export default function App() {
             ) : (
               <>
                 <p className="agent-card__value agent-card__muted">No active task</p>
-                <p className="agent-card__sub">Queue a task in Ready and start Ralph.</p>
+                <p className="agent-card__sub">Move tasks from Backlog to Todo and start {agentLabel}.</p>
               </>
             )}
           </div>
@@ -615,6 +985,7 @@ export default function App() {
                   onChange={handleWorkspaceChange}
                   placeholder="/path/to/project"
                   aria-label="Workspace path"
+                  disabled={!activeAgentId}
                 />
                 <button className="workspace-form__button" type="submit" disabled={!canSaveWorkspace}>
                   {workspaceButtonLabel}
@@ -635,7 +1006,7 @@ export default function App() {
                 className="ghost-button ghost-button--inverse"
                 type="button"
                 onClick={handleClearLogs}
-                disabled={isClearingLogs}
+                disabled={isClearingLogs || !activeAgentId}
               >
                 Clear
               </button>
@@ -649,7 +1020,7 @@ export default function App() {
             </div>
           </div>
           <pre className={`log-panel__body ${isExpandedLog ? 'log-panel__body--expanded' : ''}`}>
-            {logs.length ? logs.join('\n') : 'RALPH_WAITING - No tasks in ready queue'}
+            {logs.length ? logs.join('\n') : 'RALPH_WAITING - No todo tasks'}
           </pre>
         </div>
       </section>
@@ -657,7 +1028,7 @@ export default function App() {
       <section className="board" aria-label="Task board">
         {COLUMNS.map((column) => {
           const columnTasks = tasksByStatus.get(column.id) ?? []
-          const canDrop = column.id === 'backlog' || column.id === 'plan' || column.id === 'ready'
+          const canDrop = true
           const isDropTarget = dropTarget === column.id
           const quickValue = quickTitleByColumn[column.id] ?? ''
           const isQuickCreate = creatingColumns.has(column.id)
@@ -690,6 +1061,7 @@ export default function App() {
                       type="button"
                       onClick={() => openModalForColumn(column.id)}
                       aria-label={`Add detailed task to ${column.label}`}
+                      disabled={!activeAgentId}
                     >
                       +
                     </button>
@@ -711,11 +1083,12 @@ export default function App() {
                     onChange={(event) => handleQuickTitleChange(column.id, event.target.value)}
                     placeholder={`Add to ${column.label}`}
                     aria-label={`Add task to ${column.label}`}
+                    disabled={!activeAgentId}
                   />
                   <button
                     className="column__button"
                     type="submit"
-                    disabled={isQuickCreate || !quickValue.trim()}
+                    disabled={isQuickCreate || !quickValue.trim() || !activeAgentId}
                   >
                     {isQuickCreate ? 'Adding' : 'Add'}
                   </button>
@@ -730,10 +1103,14 @@ export default function App() {
                     <TaskCard
                       key={task.id}
                       task={task}
-                      draggable={task.status !== 'active'}
+                      draggable={!pendingTaskIds.has(task.id)}
                       isPending={pendingTaskIds.has(task.id)}
                       onDragStart={handleDragStart}
                       onReview={handleReview}
+                      onEdit={openModalForEdit}
+                      onDelete={deleteTask}
+                      onCodex={handleCodex}
+                      onOpenPr={handleOpenPr}
                     />
                   ))
                 )}
@@ -747,7 +1124,7 @@ export default function App() {
         <div className="modal-overlay" role="dialog" aria-modal="true">
           <div className="modal">
             <header className="modal__header">
-              <h2>Add task</h2>
+              <h2>{isEditing ? 'Edit task' : 'Add task'}</h2>
               <button className="ghost-button" type="button" onClick={closeModal}>
                 Close
               </button>
@@ -758,7 +1135,7 @@ export default function App() {
                 <input
                   value={newTitle}
                   onChange={(event) => setNewTitle(event.target.value)}
-                  placeholder="Describe the task to plan or queue"
+                  placeholder="Describe the task"
                   autoFocus
                 />
               </label>
@@ -774,11 +1151,11 @@ export default function App() {
                 <label className="field field--inline">
                   <span>Column</span>
                   <select value={newStatus} onChange={(event) => setNewStatus(event.target.value)}>
-                    <option value="backlog">Backlog</option>
-                    <option value="plan">Plan</option>
-                    <option value="ready">Ready</option>
-                    <option value="review">Review</option>
-                    <option value="done">Done</option>
+                    {COLUMNS.map((column) => (
+                      <option key={column.id} value={column.id}>
+                        {column.label}
+                      </option>
+                    ))}
                   </select>
                 </label>
               </div>
@@ -813,8 +1190,8 @@ export default function App() {
                 />
                 <span>Passes acceptance criteria</span>
               </label>
-              <button className="primary-button" type="submit" disabled={isCreating}>
-                {isCreating ? 'Adding...' : 'Add task'}
+              <button className="primary-button" type="submit" disabled={isSavingTask}>
+                {isSavingTask ? (isEditing ? 'Saving...' : 'Adding...') : isEditing ? 'Save changes' : 'Add task'}
               </button>
             </form>
           </div>
