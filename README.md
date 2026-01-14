@@ -43,10 +43,12 @@ CORS_ORIGINS=
 ```
 
 ## PRD storage
-The app reads/writes `prd.json`. Story ids are auto-generated (`US-###`) and priority defaults to P1. The UI adds optional fields per story (`status`, `owner`, `effort`, `branch`, `commit`, `summary`) to keep board state and Ralph output.
+The app reads/writes `prd.json`. Story ids are auto-generated (`US-###`) and priority defaults to P1. The UI adds optional fields per story (`status`, `owner`, `effort`, `branch`, `commit`, `summary`) to keep board state and Ralph output. The Ralph workspace path is stored as `workspacePath`.
 
 ## API quick reference
 - `GET /api/state`
+- `POST /api/workspace`
+  - body: `{ "path": "/absolute/path" }`
 - `POST /api/tasks`
   - body: `{ "title": "...", "acceptance_criteria": ["..."], "priority": 1-3, "passes": false, "notes": "...", "status": "backlog|plan|ready|review|done" }`
 - `PATCH /api/tasks/{task_id}`

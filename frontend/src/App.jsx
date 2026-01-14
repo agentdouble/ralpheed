@@ -164,6 +164,9 @@ export default function App() {
   const [isPullingLatest, setIsPullingLatest] = useState(false)
   const [isClearingLogs, setIsClearingLogs] = useState(false)
   const [isExpandedLog, setIsExpandedLog] = useState(false)
+  const [workspacePath, setWorkspacePath] = useState('')
+  const [isSavingWorkspace, setIsSavingWorkspace] = useState(false)
+  const [workspaceDirty, setWorkspaceDirty] = useState(false)
 
   const [pendingTaskIds, setPendingTaskIds] = useState(new Set())
   const [dropTarget, setDropTarget] = useState(null)
@@ -175,6 +178,7 @@ export default function App() {
   const tasks = board?.tasks ?? []
   const agent = board?.agent ?? null
   const logs = board?.logs ?? []
+  const workspacePathFromBoard = board?.workspace_path ?? ''
 
   const currentTask = useMemo(() => {
     if (!agent?.current_task_id) return null
@@ -244,6 +248,12 @@ export default function App() {
       window.clearTimeout(timerId)
     }
   }, [apiBaseUrl])
+
+  useEffect(() => {
+    if (!workspaceDirty && workspacePathFromBoard !== workspacePath) {
+      setWorkspacePath(workspacePathFromBoard)
+    }
+  }, [workspaceDirty, workspacePath, workspacePathFromBoard])
 
   const resetModalFields = (status = 'backlog') => {
     setNewTitle('')
@@ -360,6 +370,23 @@ export default function App() {
   const handleClearLogs = async () => {
     if (isClearingLogs) return
     await safePost('/api/logs/clear', null, setIsClearingLogs)
+  }
+
+  const handleWorkspaceChange = (event) => {
+    const nextValue = event.target.value
+    setWorkspacePath(nextValue)
+    setWorkspaceDirty(nextValue !== workspacePathFromBoard)
+  }
+
+  const handleWorkspaceSave = async (event) => {
+    event.preventDefault()
+    if (isSavingWorkspace) return
+    const trimmed = workspacePath.trim()
+    if (!trimmed) return
+    const data = await safePost('/api/workspace', { path: trimmed }, setIsSavingWorkspace)
+    if (data) {
+      setWorkspaceDirty(false)
+    }
   }
 
   const handleCreateTask = async (event) => {
@@ -499,6 +526,10 @@ export default function App() {
     await updateTask(taskId, { status })
   }
 
+  const hasWorkspacePath = workspacePath.trim().length > 0
+  const canSaveWorkspace = workspaceDirty && hasWorkspacePath && !isSavingWorkspace
+  const workspaceButtonLabel = isSavingWorkspace ? 'Saving' : workspaceDirty || !hasWorkspacePath ? 'Save' : 'Saved'
+
   return (
     <div className="app">
       <header className="topbar">
@@ -573,6 +604,23 @@ export default function App() {
                 <p className="agent-status__value">{formatClock(agent?.last_update)}</p>
               </div>
             </div>
+          </div>
+          <div className="agent-card agent-card--workspace">
+            <p className="agent-card__label">Workspace</p>
+            <form className="workspace-form" onSubmit={handleWorkspaceSave}>
+              <div className="workspace-form__row">
+                <input
+                  className="workspace-form__input"
+                  value={workspacePath}
+                  onChange={handleWorkspaceChange}
+                  placeholder="/path/to/project"
+                  aria-label="Workspace path"
+                />
+                <button className="workspace-form__button" type="submit" disabled={!canSaveWorkspace}>
+                  {workspaceButtonLabel}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
 
