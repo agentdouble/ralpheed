@@ -442,6 +442,67 @@
   align-items: center;
 }
 
+.log-panel__tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 16px 10px;
+}
+
+.log-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.log-tab__button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(226, 232, 240, 0.18);
+  background: rgba(15, 23, 42, 0.4);
+  color: rgba(226, 232, 240, 0.75);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 4px 10px;
+  cursor: pointer;
+  appearance: none;
+}
+
+.log-tab__button--active {
+  border-color: rgba(226, 232, 240, 0.45);
+  background: rgba(226, 232, 240, 0.12);
+  color: rgba(226, 232, 240, 0.95);
+}
+
+.log-tab__close {
+  border-radius: 999px;
+  border: 1px solid rgba(226, 232, 240, 0.18);
+  background: rgba(15, 23, 42, 0.35);
+  color: rgba(226, 232, 240, 0.72);
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 7px;
+  cursor: pointer;
+  appearance: none;
+}
+
+.log-tab__close:hover {
+  color: rgba(226, 232, 240, 0.95);
+  border-color: rgba(226, 232, 240, 0.45);
+}
+
+.log-tab__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(34, 197, 94, 0.9);
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.15);
+}
+
 .log-panel__body {
   margin: 0;
   padding: 14px 16px 18px;
@@ -732,6 +793,7 @@
   border-radius: 999px;
   font-size: 11px;
   font-weight: 600;
+  font-family: inherit;
   color: rgba(31, 28, 23, 0.64);
   background: rgba(246, 239, 230, 0.86);
   border: 1px solid rgba(31, 28, 23, 0.08);
@@ -747,6 +809,23 @@
   background: rgba(34, 197, 94, 0.12);
   color: rgba(34, 197, 94, 0.75);
   border-color: rgba(34, 197, 94, 0.22);
+}
+
+.meta-chip--run {
+  cursor: pointer;
+  appearance: none;
+}
+
+.meta-chip--ralph {
+  background: rgba(15, 118, 110, 0.12);
+  color: rgba(15, 118, 110, 0.85);
+  border-color: rgba(15, 118, 110, 0.25);
+}
+
+.meta-chip--openpr {
+  background: rgba(59, 130, 246, 0.12);
+  color: rgba(59, 130, 246, 0.9);
+  border-color: rgba(59, 130, 246, 0.25);
 }
 
 .task-actions {
@@ -812,6 +891,12 @@
   background: rgba(59, 130, 246, 0.12);
   color: rgba(59, 130, 246, 0.92);
   border-color: rgba(59, 130, 246, 0.25);
+}
+
+.chip-button--start {
+  background: rgba(234, 88, 12, 0.12);
+  color: rgba(234, 88, 12, 0.92);
+  border-color: rgba(234, 88, 12, 0.25);
 }
 
 .chip-button:hover:not(:disabled) {

@@ -57,19 +57,35 @@ The app reads/writes `prd.json`. Multi-agent state is stored under `agents`, eac
 - `GET /api/state?agent_id=agent-1`
 - `POST /api/workspace?agent_id=agent-1`
   - body: `{ "path": "/absolute/path" }`
+- `POST /api/acceptance-criteria`
+  - body: `{ "title": "..." }`
+  - response: `{ "criteria": ["...", "..."] }`
+- `POST /api/tasks/ai?agent_id=agent-1`
+  - body: `{ "count": 3, "theme": "..." }`
+  - response: `{ "tasks": [ ... ] }`
 - `POST /api/tasks?agent_id=agent-1`
   - body: `{ "title": "...", "acceptance_criteria": ["..."], "priority": 1-3, "passes": false, "notes": "...", "status": "backlog|todo|review|done" }`
 - `PATCH /api/tasks/{task_id}?agent_id=agent-1`
   - body: `{ "status": "backlog|todo|review|done", "priority": 1-3, "passes": true, "notes": "...", ... }`
 - `POST /api/tasks/{task_id}/codex?agent_id=agent-1` (review only; opens iTerm running Codex in the task worktree)
+- `POST /api/tasks/{task_id}/start?agent_id=agent-1` (review only; opens iTerm and runs `./start.sh` in the task worktree)
 - `POST /api/tasks/{task_id}/openpr?agent_id=agent-1` (review only; runs the `openpr` prompt via Codex; uses `prompts/openpr.md` or `~/.codex/prompts/openpr.md` when present, otherwise sends `/prompts:openpr`)
+- `POST /api/tasks/{task_id}/openpr/stop?agent_id=agent-1`
 
-Note: when a task is marked `passes: true`, its status is automatically moved to `review` (unless already `done`).
 Ralph only processes tasks in `todo`.
 Ralph processes todo tasks in rounds (up to the `iterations` count); tasks that stay `todo` are retried in the next round.
+Approving a review automatically triggers the OpenPR flow (the OpenPR button remains available for manual runs).
+The progress log UI shows per-agent tabs (All, Ralph, OpenPR per task) when corresponding logs exist.
+Dragging a task from Review to Done approves it (and triggers OpenPR).
+Tasks show running Ralph/OpenPR badges; clicking them jumps to the matching log tab.
+OpenPR tabs can be closed; closing a running tab stops that subagent.
+The AI Criteria button can populate missing acceptance criteria across tasks.
+The AI Tasks button can create backlog tasks from a theme (or project context).
 - `DELETE /api/tasks/{task_id}?agent_id=agent-1`
 - `POST /api/ralph/start?agent_id=agent-1`
   - body (optional): `{ "iterations": 10 }`
+- `POST /api/ralph/stop?agent_id=agent-1`
+- `POST /api/openpr/stop?agent_id=agent-1`
 - `POST /api/tasks/{task_id}/review?agent_id=agent-1`
   - body: `{ "decision": "approved|rejected" }`
 - `POST /api/pull-latest?agent_id=agent-1` (stub)
@@ -78,4 +94,6 @@ Ralph processes todo tasks in rounds (up to the `iterations` count); tasks that 
   - body (optional): `{ "iterations": 10 }`
 
 Note: while Ralph is running, task/workspace mutations return 409 to avoid concurrent writes to `prd.json`.
-Note: on macOS, the Codex button requires iTerm to be installed.
+Note: on macOS, the Codex and Start buttons require iTerm to be installed.
+Note: `POST /api/acceptance-criteria` runs Codex in the background and requires the `codex` CLI.
+Note: `POST /api/tasks/ai` runs Codex in the background and requires the `codex` CLI.

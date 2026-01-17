@@ -12,6 +12,9 @@ const COLUMNS = [
 
 const QUICK_COLUMNS = new Set(['backlog'])
 const DEFAULT_QUICK_TITLES = { backlog: '' }
+const AI_TASK_COUNT_MIN = 1
+const AI_TASK_COUNT_MAX = 8
+const DEFAULT_AI_TASK_COUNT = 3
 
 const clampPriority = (value) => {
   const parsed = Number(value)
@@ -85,6 +88,15 @@ const parseIterations = (value) => {
   return parsed
 }
 
+const parseAiTaskCount = (value) => {
+  const raw = String(value ?? '').trim()
+  if (!raw) return null
+  const parsed = Number.parseInt(raw, 10)
+  if (Number.isNaN(parsed) || parsed < AI_TASK_COUNT_MIN) return undefined
+  if (parsed > AI_TASK_COUNT_MAX) return AI_TASK_COUNT_MAX
+  return parsed
+}
+
 const TaskCard = ({
   task,
   draggable,
@@ -95,6 +107,9 @@ const TaskCard = ({
   onDelete,
   onCodex,
   onOpenPr,
+  onStart,
+  runState,
+  onSelectLogTab,
 }) => {
   const priorityValue = clampPriority(task.priority)
   const tone = priorityTone(priorityValue)
@@ -134,6 +149,24 @@ const TaskCard = ({
         {task.branch ? <span className="meta-chip meta-chip--mono">{task.branch}</span> : null}
         {task.commit ? <span className="meta-chip meta-chip--mono">{task.commit}</span> : null}
         {task.passes ? <span className="meta-chip meta-chip--pass">Passes</span> : null}
+        {runState?.ralph ? (
+          <button
+            className="meta-chip meta-chip--run meta-chip--ralph"
+            type="button"
+            onClick={() => onSelectLogTab?.('ralph')}
+          >
+            Ralph running
+          </button>
+        ) : null}
+        {runState?.openpr ? (
+          <button
+            className="meta-chip meta-chip--run meta-chip--openpr"
+            type="button"
+            onClick={() => onSelectLogTab?.(`openpr:${task.id}`)}
+          >
+            OpenPR running
+          </button>
+        ) : null}
       </div>
 
       {task.status === 'review' ? (
@@ -164,6 +197,14 @@ const TaskCard = ({
               disabled={isPending}
             >
               Codex
+            </button>
+            <button
+              className="chip-button chip-button--start"
+              type="button"
+              onClick={() => onStart(task.id)}
+              disabled={isPending}
+            >
+              Start
             </button>
             <button
               className="chip-button chip-button--openpr"
@@ -220,6 +261,7 @@ export default function App() {
   const [actionError, setActionError] = useState('')
 
   const [isAddOpen, setIsAddOpen] = useState(false)
+  const [isAiTasksOpen, setIsAiTasksOpen] = useState(false)
   const [editingTaskId, setEditingTaskId] = useState(null)
   const [quickTitleByColumn, setQuickTitleByColumn] = useState(DEFAULT_QUICK_TITLES)
   const [creatingColumns, setCreatingColumns] = useState(new Set())
@@ -231,11 +273,20 @@ export default function App() {
   const [newNotes, setNewNotes] = useState('')
   const [newStatus, setNewStatus] = useState('backlog')
   const [isSavingTask, setIsSavingTask] = useState(false)
+  const [isGeneratingCriteria, setIsGeneratingCriteria] = useState(false)
+  const [isGeneratingAllCriteria, setIsGeneratingAllCriteria] = useState(false)
+  const [aiTaskCountInput, setAiTaskCountInput] = useState(String(DEFAULT_AI_TASK_COUNT))
+  const [aiTaskTheme, setAiTaskTheme] = useState('')
+  const [isGeneratingAiTasks, setIsGeneratingAiTasks] = useState(false)
 
   const [isStartingAgent, setIsStartingAgent] = useState(false)
   const [isPullingLatest, setIsPullingLatest] = useState(false)
   const [isClearingLogs, setIsClearingLogs] = useState(false)
+  const [isStoppingRalph, setIsStoppingRalph] = useState(false)
+  const [isStoppingOpenPr, setIsStoppingOpenPr] = useState(false)
   const [isExpandedLog, setIsExpandedLog] = useState(false)
+  const [activeLogTab, setActiveLogTab] = useState('all')
+  const [closedOpenPrTabs, setClosedOpenPrTabs] = useState(new Set())
   const [workspacePath, setWorkspacePath] = useState('')
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false)
   const [workspaceDirty, setWorkspaceDirty] = useState(false)
@@ -248,6 +299,12 @@ export default function App() {
   const fetchVersionRef = useRef(0)
   const stateVersionRef = useRef(0)
   const actionsLockRef = useRef(false)
+  const criteriaRequestRef = useRef(0)
+  const criteriaAbortRef = useRef(null)
+  const criteriaBatchRequestRef = useRef(0)
+  const criteriaBatchAbortRef = useRef(null)
+  const aiTasksRequestRef = useRef(0)
+  const aiTasksAbortRef = useRef(null)
   const activeAgentRef = useRef('')
 
   const activeAgent = useMemo(
@@ -261,6 +318,10 @@ export default function App() {
   const workspacePathFromBoard = board?.workspace_path ?? ''
   const agentLabel = activeAgent?.name ?? agent?.name ?? 'Agent'
   const isEditing = Boolean(editingTaskId)
+  const missingCriteriaTasks = useMemo(
+    () => tasks.filter((task) => !Array.isArray(task.acceptance_criteria) || task.acceptance_criteria.length === 0),
+    [tasks]
+  )
 
   useEffect(() => {
     activeAgentRef.current = activeAgentId
@@ -292,6 +353,182 @@ export default function App() {
     const url = new URL(`${apiBaseUrl}${path}`)
     if (agentId) url.searchParams.set('agent_id', agentId)
     return url.toString()
+  }
+
+  const parseLogMeta = (message) => {
+    if (message.startsWith('OPENPR_')) {
+      const match = message.match(/^OPENPR_[A-Z_]+ - ([A-Z]+-\d+)/)
+      return { kind: 'openpr', taskId: match ? match[1] : null }
+    }
+    if (message.startsWith('RALPH_')) {
+      const match = message.match(/^RALPH_[A-Z_]+ - ([A-Z]+-\d+)/)
+      return { kind: 'ralph', taskId: match ? match[1] : null }
+    }
+    return { kind: 'other', taskId: null }
+  }
+
+  const logEntries = useMemo(() => {
+    return logs.map((line) => {
+      const separatorIndex = line.indexOf('  ')
+      const message = separatorIndex === -1 ? line : line.slice(separatorIndex + 2)
+      return { line, message, ...parseLogMeta(message) }
+    })
+  }, [logs])
+
+  const parseLogTaskId = (message, prefix) => {
+    if (!message.startsWith(prefix)) return null
+    const rest = message.slice(prefix.length).trim()
+    if (!rest) return null
+    return rest.split(' ')[0]
+  }
+
+  const runStateByTaskId = useMemo(() => {
+    const map = new Map()
+    const applyState = (taskId, key, value) => {
+      if (!taskId) return
+      const current = map.get(taskId) || { ralph: false, openpr: false }
+      map.set(taskId, { ...current, [key]: value })
+    }
+
+    for (const entry of logEntries) {
+      const message = entry.message
+      const openStart = parseLogTaskId(message, 'OPENPR_START -')
+      if (openStart) {
+        applyState(openStart, 'openpr', true)
+        continue
+      }
+      const openDone = parseLogTaskId(message, 'OPENPR_DONE -')
+      if (openDone) {
+        applyState(openDone, 'openpr', false)
+        continue
+      }
+      const openCut = parseLogTaskId(message, 'OPENPR_CUT -')
+      if (openCut) {
+        applyState(openCut, 'openpr', false)
+        continue
+      }
+      const openStop = parseLogTaskId(message, 'OPENPR_STOP -')
+      if (openStop) {
+        applyState(openStop, 'openpr', false)
+        continue
+      }
+      const openError = parseLogTaskId(message, 'OPENPR_ERROR -')
+      if (openError) {
+        applyState(openError, 'openpr', false)
+        continue
+      }
+
+      const ralphPrep = parseLogTaskId(message, 'RALPH_PREP -')
+      if (ralphPrep) {
+        applyState(ralphPrep, 'ralph', true)
+        continue
+      }
+      const ralphDone = parseLogTaskId(message, 'RALPH_DONE -')
+      if (ralphDone) {
+        applyState(ralphDone, 'ralph', false)
+        continue
+      }
+      const ralphCut = parseLogTaskId(message, 'RALPH_CUT -')
+      if (ralphCut) {
+        applyState(ralphCut, 'ralph', false)
+      }
+    }
+
+    return map
+  }, [logEntries])
+
+  const ralphActive = useMemo(() => {
+    let lastStart = -1
+    let lastWait = -1
+    let lastCut = -1
+    logEntries.forEach((entry, index) => {
+      if (entry.message.startsWith('RALPH_START')) lastStart = index
+      if (entry.message.startsWith('RALPH_WAITING')) lastWait = index
+      if (entry.message.startsWith('RALPH_CUT')) lastCut = index
+    })
+    return lastStart > Math.max(lastWait, lastCut)
+  }, [logEntries])
+
+  const openPrRunningByTaskId = useMemo(() => {
+    const map = new Map()
+    for (const entry of logEntries) {
+      if (entry.kind !== 'openpr' || !entry.taskId) continue
+      if (entry.message.startsWith('OPENPR_START')) map.set(entry.taskId, true)
+      if (entry.message.startsWith('OPENPR_DONE')) map.set(entry.taskId, false)
+      if (entry.message.startsWith('OPENPR_CUT')) map.set(entry.taskId, false)
+      if (entry.message.startsWith('OPENPR_STOP')) map.set(entry.taskId, false)
+      if (entry.message.startsWith('OPENPR_ERROR')) map.set(entry.taskId, false)
+    }
+    return map
+  }, [logEntries])
+
+  const openPrTaskIds = useMemo(() => {
+    const ids = new Set()
+    for (const entry of logEntries) {
+      if (entry.kind === 'openpr' && entry.taskId) {
+        ids.add(entry.taskId)
+      }
+    }
+    return Array.from(ids)
+  }, [logEntries])
+
+  const openPrActive = useMemo(() => {
+    for (const value of openPrRunningByTaskId.values()) {
+      if (value) return true
+    }
+    return false
+  }, [openPrRunningByTaskId])
+
+  const logTabs = useMemo(() => {
+    const tabs = [{ id: 'all', label: 'All', running: false }]
+    if (logEntries.some((entry) => entry.message.startsWith('RALPH_'))) {
+      tabs.push({ id: 'ralph', label: 'Ralph', running: ralphActive })
+    }
+    for (const taskId of openPrTaskIds) {
+      const running = openPrRunningByTaskId.get(taskId) === true
+      if (closedOpenPrTabs.has(taskId) && !running) {
+        continue
+      }
+      tabs.push({
+        id: `openpr:${taskId}`,
+        label: `OpenPR ${taskId}`,
+        running,
+        closable: true,
+        taskId,
+      })
+    }
+    return tabs
+  }, [closedOpenPrTabs, logEntries, openPrRunningByTaskId, openPrTaskIds, ralphActive])
+
+  const visibleLogs = useMemo(() => {
+    if (activeLogTab === 'ralph') {
+      return logEntries.filter((entry) => entry.message.startsWith('RALPH_')).map((entry) => entry.line)
+    }
+    if (activeLogTab.startsWith('openpr:')) {
+      const taskId = activeLogTab.slice('openpr:'.length)
+      return logEntries
+        .filter((entry) => entry.kind === 'openpr' && entry.taskId === taskId)
+        .map((entry) => entry.line)
+    }
+    return logs
+  }, [activeLogTab, logEntries, logs])
+
+  const abortCriteriaRequest = () => {
+    if (!criteriaAbortRef.current) return
+    criteriaAbortRef.current.abort()
+    criteriaAbortRef.current = null
+  }
+
+  const abortCriteriaBatch = () => {
+    if (!criteriaBatchAbortRef.current) return
+    criteriaBatchAbortRef.current.abort()
+    criteriaBatchAbortRef.current = null
+  }
+
+  const abortAiTasksRequest = () => {
+    if (!aiTasksAbortRef.current) return
+    aiTasksAbortRef.current.abort()
+    aiTasksAbortRef.current = null
   }
 
   const bumpStateVersion = () => {
@@ -413,14 +650,24 @@ export default function App() {
   }, [apiBaseUrl, activeAgentId])
 
   useEffect(() => {
+    if (!logTabs.some((tab) => tab.id === activeLogTab)) {
+      setActiveLogTab('all')
+    }
+  }, [activeLogTab, logTabs])
+
+  useEffect(() => {
     if (!workspaceDirty && workspacePathFromBoard !== workspacePath) {
       setWorkspacePath(workspacePathFromBoard)
     }
   }, [workspaceDirty, workspacePath, workspacePathFromBoard])
 
   useEffect(() => {
+    abortCriteriaRequest()
+    abortCriteriaBatch()
+    abortAiTasksRequest()
     setBoard(null)
     setIsAddOpen(false)
+    setIsAiTasksOpen(false)
     setEditingTaskId(null)
     setQuickTitleByColumn({ ...DEFAULT_QUICK_TITLES })
     setCreatingColumns(new Set())
@@ -431,15 +678,24 @@ export default function App() {
     setNewNotes('')
     setNewStatus('backlog')
     setIsSavingTask(false)
+    setIsGeneratingCriteria(false)
+    setIsGeneratingAllCriteria(false)
+    setIsGeneratingAiTasks(false)
+    setAiTaskCountInput(String(DEFAULT_AI_TASK_COUNT))
+    setAiTaskTheme('')
     setIsStartingAgent(false)
     setIsPullingLatest(false)
     setIsClearingLogs(false)
+    setIsStoppingRalph(false)
+    setIsStoppingOpenPr(false)
     setIsSavingWorkspace(false)
     setWorkspacePath('')
     setWorkspaceDirty(false)
     setPendingTaskIds(new Set())
     setDropTarget(null)
     setActionError('')
+    setActiveLogTab('all')
+    setClosedOpenPrTabs(new Set())
   }, [activeAgentId])
 
   const resetModalFields = (status = 'backlog') => {
@@ -452,9 +708,29 @@ export default function App() {
   }
 
   const closeModal = () => {
+    abortCriteriaRequest()
+    setIsGeneratingCriteria(false)
     setIsAddOpen(false)
     setEditingTaskId(null)
     resetModalFields('backlog')
+  }
+
+  const resetAiTasksForm = () => {
+    setAiTaskCountInput(String(DEFAULT_AI_TASK_COUNT))
+    setAiTaskTheme('')
+  }
+
+  const closeAiTasksPanel = () => {
+    abortAiTasksRequest()
+    setIsGeneratingAiTasks(false)
+    setIsAiTasksOpen(false)
+    resetAiTasksForm()
+  }
+
+  const openAiTasksPanel = () => {
+    closeModal()
+    setActionError('')
+    setIsAiTasksOpen(true)
   }
 
   const openModalForColumn = (status, seedTitle = '') => {
@@ -612,7 +888,34 @@ export default function App() {
 
   const handleClearLogs = async () => {
     if (isClearingLogs || !activeAgentId) return
-    await safePost('/api/logs/clear', null, setIsClearingLogs)
+    const data = await safePost('/api/logs/clear', null, setIsClearingLogs)
+    if (data) {
+      setActiveLogTab('all')
+      setClosedOpenPrTabs(new Set())
+    }
+  }
+
+  const handleCloseOpenPrTab = async (taskId, running) => {
+    if (!taskId) return
+    if (running) {
+      const data = await safePost(`/api/tasks/${taskId}/openpr/stop`, null, () => {})
+      if (!data) return
+    }
+    setClosedOpenPrTabs((prev) => {
+      const next = new Set(prev)
+      next.add(taskId)
+      return next
+    })
+  }
+
+  const handleStopRalph = async () => {
+    if (isStoppingRalph || !activeAgentId) return
+    await safePost('/api/ralph/stop', null, setIsStoppingRalph)
+  }
+
+  const handleStopOpenPr = async () => {
+    if (isStoppingOpenPr || !activeAgentId) return
+    await safePost('/api/openpr/stop', null, setIsStoppingOpenPr)
   }
 
   const handleWorkspaceChange = (event) => {
@@ -652,11 +955,11 @@ export default function App() {
         priority: newPriority,
         passes: newPasses,
         notes: newNotes.trim(),
-        status: newStatus === 'done' ? 'review' : newStatus,
+        status: isEditing ? newStatus : newStatus === 'done' ? 'review' : newStatus,
       }
 
       if (isEditing) {
-        await updateTask(editingTaskId, payload)
+        await updateTask(editingTaskId, payload, { allowDone: true })
       } else {
         await createTask(payload)
       }
@@ -665,6 +968,178 @@ export default function App() {
       setActionError(isEditing ? 'Unable to update task. Try again.' : 'Unable to add task. Check the API and try again.')
     } finally {
       setIsSavingTask(false)
+    }
+  }
+
+  const handleGenerateCriteria = async () => {
+    if (isGeneratingCriteria) return
+
+    const title = newTitle.trim()
+    if (!title) {
+      setActionError('Task title is required.')
+      return
+    }
+
+    abortCriteriaRequest()
+    abortCriteriaBatch()
+    const controller = new AbortController()
+    criteriaAbortRef.current = controller
+    const requestId = criteriaRequestRef.current + 1
+    criteriaRequestRef.current = requestId
+    setIsGeneratingCriteria(true)
+    setActionError('')
+
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/acceptance-criteria`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+        signal: controller.signal,
+      })
+      if (!res.ok) throw new Error(`Acceptance criteria failed (${res.status})`)
+      const data = await res.json()
+      if (criteriaRequestRef.current !== requestId) return
+      const criteria = Array.isArray(data?.criteria) ? data.criteria : []
+      setNewAcceptanceText(formatAcceptanceCriteria(criteria))
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setActionError('Unable to generate criteria. Try again.')
+      }
+    } finally {
+      if (criteriaRequestRef.current === requestId) {
+        setIsGeneratingCriteria(false)
+        criteriaAbortRef.current = null
+      }
+    }
+  }
+
+  const handleGenerateMissingCriteria = async () => {
+    if (isGeneratingAllCriteria || !activeAgentId) return
+    if (missingCriteriaTasks.length === 0) return
+
+    abortCriteriaRequest()
+    abortCriteriaBatch()
+    const controller = new AbortController()
+    criteriaBatchAbortRef.current = controller
+    const requestId = criteriaBatchRequestRef.current + 1
+    criteriaBatchRequestRef.current = requestId
+    const requestAgentId = activeAgentId
+    setIsGeneratingAllCriteria(true)
+    setActionError('')
+
+    try {
+      for (const task of missingCriteriaTasks) {
+        if (criteriaBatchRequestRef.current !== requestId) return
+        if (controller.signal.aborted) return
+        if (activeAgentRef.current !== requestAgentId) return
+
+        const title = String(task.title ?? '').trim()
+        if (!title) continue
+
+        const res = await fetch(`${apiBaseUrl}/api/acceptance-criteria`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title }),
+          signal: controller.signal,
+        })
+        if (!res.ok) throw new Error(`Acceptance criteria failed (${res.status})`)
+        const data = await res.json()
+        if (criteriaBatchRequestRef.current !== requestId) return
+        const criteria = Array.isArray(data?.criteria) ? data.criteria : []
+        if (criteria.length === 0) continue
+        const updated = await updateTask(task.id, { acceptance_criteria: criteria })
+        if (!updated) throw new Error('Update failed')
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setActionError('Unable to generate criteria for all tasks. Try again.')
+      }
+    } finally {
+      if (criteriaBatchRequestRef.current === requestId) {
+        setIsGeneratingAllCriteria(false)
+        criteriaBatchAbortRef.current = null
+      }
+    }
+  }
+
+  const handleGenerateAiTasks = async (event) => {
+    event.preventDefault()
+    if (isGeneratingAiTasks || !activeAgentId) return
+
+    const parsedCount = parseAiTaskCount(aiTaskCountInput)
+    if (parsedCount === undefined) {
+      setActionError('Task count must be a positive number.')
+      return
+    }
+
+    const count = parsedCount === null ? DEFAULT_AI_TASK_COUNT : parsedCount
+    const theme = aiTaskTheme.trim()
+    const requestAgentId = activeAgentId
+    abortAiTasksRequest()
+    const controller = new AbortController()
+    aiTasksAbortRef.current = controller
+    const requestId = aiTasksRequestRef.current + 1
+    aiTasksRequestRef.current = requestId
+    setIsGeneratingAiTasks(true)
+    setActionError('')
+
+    try {
+      const res = await fetch(buildAgentUrl('/api/tasks/ai', requestAgentId), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count, theme }),
+        signal: controller.signal,
+      })
+      if (!res.ok) throw new Error(`AI tasks failed (${res.status})`)
+      const data = await res.json()
+      if (aiTasksRequestRef.current !== requestId) return
+      if (activeAgentRef.current !== requestAgentId) return
+      const created = Array.isArray(data?.tasks) ? data.tasks : []
+      if (created.length === 0) {
+        setActionError('Unable to generate tasks. Try again.')
+        return
+      }
+      bumpStateVersion()
+      setBoard((prev) => {
+        const fallbackAgent = {
+          id: requestAgentId,
+          name: agentLabel,
+          status: 'waiting',
+          signal: 'RALPH_WAITING',
+          last_update: new Date().toISOString(),
+          current_task_id: null,
+        }
+
+        if (!prev || prev.agent?.id !== requestAgentId) {
+          return {
+            agent: fallbackAgent,
+            tasks: created,
+            logs: [],
+            workspace_path: '',
+          }
+        }
+
+        const existingIds = new Set(prev.tasks.map((task) => task.id))
+        const nextTasks = [...prev.tasks]
+        for (const task of created) {
+          if (!task || existingIds.has(task.id)) continue
+          nextTasks.push(task)
+        }
+        return {
+          ...prev,
+          tasks: nextTasks,
+        }
+      })
+      closeAiTasksPanel()
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setActionError('Unable to generate tasks. Try again.')
+      }
+    } finally {
+      if (aiTasksRequestRef.current === requestId) {
+        setIsGeneratingAiTasks(false)
+        aiTasksAbortRef.current = null
+      }
     }
   }
 
@@ -707,10 +1182,11 @@ export default function App() {
     }
   }
 
-  const updateTask = async (taskId, patch) => {
+  const updateTask = async (taskId, patch, options = {}) => {
     if (!taskId || !activeAgentId) return
     const requestAgentId = activeAgentId
-    const nextPatch = patch?.status === 'done' ? { ...patch, status: 'review' } : patch
+    const allowDone = options.allowDone ?? false
+    const nextPatch = patch?.status === 'done' && !allowDone ? { ...patch, status: 'review' } : patch
     setPendingTaskIds((prev) => mergeSet(prev, taskId, true))
     setActionError('')
     try {
@@ -722,16 +1198,19 @@ export default function App() {
       if (!res.ok) throw new Error(`Update failed (${res.status})`)
       const updated = await res.json()
       bumpStateVersion()
-      if (activeAgentRef.current !== requestAgentId) return
-      setBoard((prev) => {
-        if (!prev || prev.agent?.id !== requestAgentId) return prev
-        return {
-          ...prev,
-          tasks: prev.tasks.map((task) => (task.id === updated.id ? updated : task)),
-        }
-      })
+      if (activeAgentRef.current === requestAgentId) {
+        setBoard((prev) => {
+          if (!prev || prev.agent?.id !== requestAgentId) return prev
+          return {
+            ...prev,
+            tasks: prev.tasks.map((task) => (task.id === updated.id ? updated : task)),
+          }
+        })
+      }
+      return updated
     } catch (error) {
       setActionError('Unable to update task. Try again.')
+      return null
     } finally {
       setPendingTaskIds((prev) => mergeSet(prev, taskId, false))
     }
@@ -801,6 +1280,10 @@ export default function App() {
     await runTaskAction(taskId, 'openpr', 'OpenPR failed. Try again.')
   }
 
+  const handleStart = async (taskId) => {
+    await runTaskAction(taskId, 'start', 'Unable to start. Try again.')
+  }
+
   const handleReview = async (taskId, decision) => {
     if (!activeAgentId) return
     const requestAgentId = activeAgentId
@@ -843,11 +1326,21 @@ export default function App() {
     const task = tasks.find((item) => item.id === taskId)
     if (!task) return
     const currentStatus = normalizeStatus(task.status)
+    if (status === 'done' && currentStatus === 'review') {
+      await handleReview(taskId, 'approved')
+      return
+    }
     const targetStatus = status === 'done' ? 'review' : status
     if (currentStatus === targetStatus) return
     await updateTask(taskId, { status: targetStatus })
   }
 
+  const canGenerateCriteria =
+    Boolean(newTitle.trim()) && !isGeneratingCriteria && !isSavingTask && Boolean(activeAgentId)
+  const missingCriteriaCount = missingCriteriaTasks.length
+  const canGenerateAllCriteria = missingCriteriaCount > 0 && !isGeneratingAllCriteria && Boolean(activeAgentId)
+  const aiTaskCountValue = parseAiTaskCount(aiTaskCountInput)
+  const canGenerateAiTasks = Boolean(activeAgentId) && !isGeneratingAiTasks && aiTaskCountValue !== undefined
   const hasWorkspacePath = workspacePath.trim().length > 0
   const canSaveWorkspace = workspaceDirty && hasWorkspacePath && !isSavingWorkspace
   const workspaceButtonLabel = isSavingWorkspace
@@ -866,6 +1359,26 @@ export default function App() {
           <span className={`pill pill--status pill--${healthStatus}`}>API {healthStatus}</span>
           <button className="ghost-button" type="button" onClick={handlePullLatest} disabled={isPullingLatest}>
             Pull Latest
+          </button>
+          <button
+            className="ghost-button"
+            type="button"
+            onClick={handleGenerateMissingCriteria}
+            disabled={!canGenerateAllCriteria}
+          >
+            {isGeneratingAllCriteria
+              ? 'AI Criteria...'
+              : missingCriteriaCount
+                ? `AI Criteria (${missingCriteriaCount})`
+                : 'AI Criteria'}
+          </button>
+          <button
+            className="ghost-button"
+            type="button"
+            onClick={openAiTasksPanel}
+            disabled={!activeAgentId || isGeneratingAiTasks}
+          >
+            AI Tasks
           </button>
           <button
             className="primary-button"
@@ -1002,6 +1515,26 @@ export default function App() {
               <p className="log-panel__hint">Latest worker events and state changes.</p>
             </div>
             <div className="log-panel__actions">
+              {ralphActive ? (
+                <button
+                  className="ghost-button ghost-button--inverse"
+                  type="button"
+                  onClick={handleStopRalph}
+                  disabled={isStoppingRalph || !activeAgentId}
+                >
+                  Stop Ralph
+                </button>
+              ) : null}
+              {openPrActive ? (
+                <button
+                  className="ghost-button ghost-button--inverse"
+                  type="button"
+                  onClick={handleStopOpenPr}
+                  disabled={isStoppingOpenPr || !activeAgentId}
+                >
+                  Stop OpenPR
+                </button>
+              ) : null}
               <button
                 className="ghost-button ghost-button--inverse"
                 type="button"
@@ -1019,8 +1552,36 @@ export default function App() {
               </button>
             </div>
           </div>
+          {logTabs.length > 1 ? (
+            <div className="log-panel__tabs" role="tablist" aria-label="Log streams">
+              {logTabs.map((tab) => (
+                <div key={tab.id} className="log-tab">
+                  <button
+                    className={`log-tab__button ${activeLogTab === tab.id ? 'log-tab__button--active' : ''}`}
+                    type="button"
+                    role="tab"
+                    aria-selected={activeLogTab === tab.id}
+                    onClick={() => setActiveLogTab(tab.id)}
+                  >
+                    <span>{tab.label}</span>
+                    {tab.running ? <span className="log-tab__dot" aria-hidden="true" /> : null}
+                  </button>
+                  {tab.closable ? (
+                    <button
+                      className="log-tab__close"
+                      type="button"
+                      aria-label={`Close ${tab.label}`}
+                      onClick={() => handleCloseOpenPrTab(tab.taskId, tab.running)}
+                    >
+                      ×
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          ) : null}
           <pre className={`log-panel__body ${isExpandedLog ? 'log-panel__body--expanded' : ''}`}>
-            {logs.length ? logs.join('\n') : 'RALPH_WAITING - No todo tasks'}
+            {visibleLogs.length ? visibleLogs.join('\n') : 'RALPH_WAITING - No todo tasks'}
           </pre>
         </div>
       </section>
@@ -1110,7 +1671,10 @@ export default function App() {
                       onEdit={openModalForEdit}
                       onDelete={deleteTask}
                       onCodex={handleCodex}
+                      onStart={handleStart}
                       onOpenPr={handleOpenPr}
+                      runState={runStateByTaskId.get(task.id)}
+                      onSelectLogTab={setActiveLogTab}
                     />
                   ))
                 )}
@@ -1162,8 +1726,13 @@ export default function App() {
               <label className="field">
                 <div className="field__row">
                   <span>Acceptance criteria (one per line)</span>
-                  <button className="field__button" type="button" disabled title="Coming soon">
-                    AI
+                  <button
+                    className="field__button"
+                    type="button"
+                    onClick={handleGenerateCriteria}
+                    disabled={!canGenerateCriteria}
+                  >
+                    {isGeneratingCriteria ? 'AI...' : 'AI'}
                   </button>
                 </div>
                 <textarea
@@ -1192,6 +1761,49 @@ export default function App() {
               </label>
               <button className="primary-button" type="submit" disabled={isSavingTask}>
                 {isSavingTask ? (isEditing ? 'Saving...' : 'Adding...') : isEditing ? 'Save changes' : 'Add task'}
+              </button>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {isAiTasksOpen ? (
+        <div className="modal-overlay" role="dialog" aria-modal="true">
+          <div className="modal">
+            <header className="modal__header">
+              <h2>AI tasks</h2>
+              <button className="ghost-button" type="button" onClick={closeAiTasksPanel}>
+                Close
+              </button>
+            </header>
+            <form className="modal__form" onSubmit={handleGenerateAiTasks}>
+              <div className="modal__row">
+                <label className="field field--inline">
+                  <span>Count</span>
+                  <input
+                    type="number"
+                    min={AI_TASK_COUNT_MIN}
+                    max={AI_TASK_COUNT_MAX}
+                    inputMode="numeric"
+                    value={aiTaskCountInput}
+                    onChange={(event) => setAiTaskCountInput(event.target.value)}
+                    placeholder={String(DEFAULT_AI_TASK_COUNT)}
+                    disabled={!activeAgentId}
+                  />
+                </label>
+                <label className="field field--inline">
+                  <span>Theme</span>
+                  <input
+                    value={aiTaskTheme}
+                    onChange={(event) => setAiTaskTheme(event.target.value)}
+                    placeholder="Feature, area"
+                    maxLength={200}
+                    disabled={!activeAgentId}
+                  />
+                </label>
+              </div>
+              <button className="primary-button" type="submit" disabled={!canGenerateAiTasks}>
+                {isGeneratingAiTasks ? 'Creating...' : 'Create tasks'}
               </button>
             </form>
           </div>
