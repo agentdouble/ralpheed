@@ -2,6 +2,7 @@
 Started: 2024-01-15
 
 ## Codebase Patterns
+- Animation: Decouple render FPS from movement rate with interpolation
 - Migrations: IF NOT EXISTS
 - Types: Export from actions.ts
 - Python: Ignore .venv/ and __pycache__/ when using uv run
@@ -49,4 +50,18 @@ Started: 2024-01-15
 - **Learnings:**
   - Patterns discovered: none.
   - Gotchas encountered: `python -m unittest` exits non-zero when no tests are collected.
+---
+## 2026-01-17 - US-006
+- Added smooth snake movement via interpolated grid positions and a render FPS separate from movement speed.
+- Files changed: snake.py, README.md, tests/test_animation.py.
+- **Learnings:**
+  - Patterns discovered: animation interpolation with decoupled render rate.
+  - Gotchas encountered: none.
+---
+## 2026-01-17 - US-007
+- Added a stylized snake head SVG icon and referenced it in the README.
+- Files changed: README.md, assets/snake-icon.svg.
+- **Learnings:**
+  - Patterns discovered: none.
+  - Gotchas encountered: none.
 ---

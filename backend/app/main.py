@@ -23,6 +23,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 PRD_PATH = ROOT_DIR / "prd.json"
 RALPH_SCRIPT_PATH = ROOT_DIR / "ralph.sh"
 DEFAULT_BRANCH_NAME = "ralph/feature"
+WORKTREE_BASE_BRANCH = "dev"
 DEFAULT_AGENT_ID = "agent-1"
 DEFAULT_AGENT_NAME = "Ralph"
 MAX_LOG_LINES = 220
@@ -215,6 +216,7 @@ AGENT_ORDER: list[str] = []
 AGENT_SEQUENCE = 1
 
 STATE_LOCK = asyncio.Lock()
+WORKTREE_LOCK = asyncio.Lock()
 
 
 def _utc_now() -> datetime:
@@ -386,8 +388,8 @@ async def _generate_acceptance_criteria(title: str) -> list[str]:
                 pass
 
 
-def _read_readme_excerpt() -> str:
-    readme_path = ROOT_DIR / "README.md"
+def _read_readme_excerpt(root_path: Path) -> str:
+    readme_path = root_path / "README.md"
     if not readme_path.is_file():
         return ""
     try:
@@ -534,14 +536,19 @@ def _clean_ai_tasks(
     return cleaned
 
 
-async def _generate_ai_tasks(count: int, theme: str, existing_titles: list[str]) -> list[dict[str, object]]:
+async def _generate_ai_tasks(
+    count: int,
+    theme: str,
+    existing_titles: list[str],
+    context_root: Path,
+) -> list[dict[str, object]]:
     if not shutil.which("codex"):
         raise HTTPException(status_code=500, detail="codex not found")
 
     proc: asyncio.subprocess.Process | None = None
     output_path: str | None = None
     stdout = b""
-    readme = _read_readme_excerpt()
+    readme = _read_readme_excerpt(context_root)
     prompt = _build_ai_tasks_prompt(count, theme, readme, existing_titles)
     try:
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
@@ -560,7 +567,7 @@ async def _generate_ai_tasks(count: int, theme: str, existing_titles: list[str])
             prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=str(ROOT_DIR),
+            cwd=str(context_root),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=AI_TASKS_TIMEOUT_SECONDS)
         if proc.returncode != 0:
@@ -721,8 +728,8 @@ def _ensure_mutation_allowed() -> None:
         raise HTTPException(status_code=409, detail="Ralph is running")
 
 
-def _resolve_workspace_path(board: AgentBoard) -> Path | None:
-    raw = board.workspace_path.strip()
+def _resolve_workspace_value(raw: str) -> Path | None:
+    raw = raw.strip()
     if not raw:
         return None
     path = Path(raw).expanduser()
@@ -731,6 +738,10 @@ def _resolve_workspace_path(board: AgentBoard) -> Path | None:
     if not path.is_dir():
         return None
     return path
+
+
+def _resolve_workspace_path(board: AgentBoard) -> Path | None:
+    return _resolve_workspace_value(board.workspace_path)
 
 
 def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -745,6 +756,21 @@ def _resolve_repo_root(path: Path) -> Path | None:
     if not root.is_dir():
         return None
     return root
+
+
+def _select_git_remote(repo_root: Path) -> tuple[str | None, str | None]:
+    result = _run_git(["git", "remote"], repo_root)
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "unable to list remotes"
+        return None, error
+    remotes = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not remotes:
+        return None, "no git remotes"
+    if "origin" in remotes:
+        return "origin", None
+    if len(remotes) == 1:
+        return remotes[0], None
+    return None, "multiple remotes without origin"
 
 
 def _worktrees_root(repo_root: Path) -> Path:
@@ -762,42 +788,62 @@ def _default_branch_for_task(task: TaskState) -> str:
     return f"feat/{task.id.lower()}"
 
 
-async def _ensure_worktree_path(repo_root: Path, branch: str) -> tuple[Path | None, str | None]:
-    worktrees_root = _worktrees_root(repo_root)
-    worktrees_root.mkdir(parents=True, exist_ok=True)
-    worktree_path = worktrees_root / _sanitize_branch_name(branch)
-
-    if worktree_path.exists():
-        if not worktree_path.is_dir():
-            return None, f"invalid path {worktree_path}"
-
-        result = await asyncio.to_thread(
-            _run_git,
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            worktree_path,
-        )
-        if result.returncode != 0:
-            error = result.stderr.strip() or "unable to read worktree"
-            return None, error
-        current_branch = result.stdout.strip()
-        if current_branch != branch:
-            return None, f"{worktree_path} on {current_branch}, expected {branch}"
-        return worktree_path, None
-
-    exists_result = await asyncio.to_thread(
-        _run_git,
-        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-        repo_root,
-    )
-    if exists_result.returncode == 0:
-        cmd = ["git", "worktree", "add", str(worktree_path), branch]
-    else:
-        cmd = ["git", "worktree", "add", "-b", branch, str(worktree_path)]
-    result = await asyncio.to_thread(_run_git, cmd, repo_root)
-    if result.returncode != 0:
-        error = (result.stderr or result.stdout).strip() or "unable to create worktree"
+async def _refresh_base_branch(repo_root: Path, base_branch: str) -> tuple[str | None, str | None]:
+    remote, error = await asyncio.to_thread(_select_git_remote, repo_root)
+    if not remote:
         return None, error
-    return worktree_path, None
+    fetch_result = await asyncio.to_thread(_run_git, ["git", "fetch", remote, base_branch], repo_root)
+    if fetch_result.returncode != 0:
+        error = fetch_result.stderr.strip() or fetch_result.stdout.strip() or "unable to fetch base branch"
+        return None, error
+    remote_ref = f"refs/remotes/{remote}/{base_branch}"
+    rev_result = await asyncio.to_thread(_run_git, ["git", "rev-parse", "--verify", remote_ref], repo_root)
+    if rev_result.returncode != 0:
+        error = rev_result.stderr.strip() or rev_result.stdout.strip() or "unable to resolve base branch"
+        return None, error
+    return remote_ref, None
+
+
+async def _ensure_worktree_path(repo_root: Path, branch: str) -> tuple[Path | None, str | None]:
+    async with WORKTREE_LOCK:
+        worktrees_root = _worktrees_root(repo_root)
+        worktrees_root.mkdir(parents=True, exist_ok=True)
+        worktree_path = worktrees_root / _sanitize_branch_name(branch)
+
+        if worktree_path.exists():
+            if not worktree_path.is_dir():
+                return None, f"invalid path {worktree_path}"
+
+            result = await asyncio.to_thread(
+                _run_git,
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                worktree_path,
+            )
+            if result.returncode != 0:
+                error = result.stderr.strip() or "unable to read worktree"
+                return None, error
+            current_branch = result.stdout.strip()
+            if current_branch != branch:
+                return None, f"{worktree_path} on {current_branch}, expected {branch}"
+            return worktree_path, None
+
+        exists_result = await asyncio.to_thread(
+            _run_git,
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            repo_root,
+        )
+        if exists_result.returncode == 0:
+            cmd = ["git", "worktree", "add", str(worktree_path), branch]
+        else:
+            base_ref, error = await _refresh_base_branch(repo_root, WORKTREE_BASE_BRANCH)
+            if not base_ref:
+                return None, error
+            cmd = ["git", "worktree", "add", "-b", branch, str(worktree_path), base_ref]
+        result = await asyncio.to_thread(_run_git, cmd, repo_root)
+        if result.returncode != 0:
+            error = (result.stderr or result.stdout).strip() or "unable to create worktree"
+            return None, error
+        return worktree_path, None
 
 
 def _escape_osascript(value: str) -> str:
@@ -1564,8 +1610,15 @@ async def create_ai_tasks(payload: AiTasksRequest, agent_id: str | None = None) 
         existing_titles = [
             task.title for task_id in board.order if (task := board.tasks.get(task_id))
         ]
+        workspace_raw = board.workspace_path
 
-    candidates = await _generate_ai_tasks(count, theme, existing_titles)
+    context_root = ROOT_DIR
+    workspace_path = _resolve_workspace_value(workspace_raw)
+    if workspace_path:
+        repo_root = await asyncio.to_thread(_resolve_repo_root, workspace_path)
+        context_root = repo_root or workspace_path
+
+    candidates = await _generate_ai_tasks(count, theme, existing_titles, context_root)
 
     async with STATE_LOCK:
         _ensure_mutation_allowed()

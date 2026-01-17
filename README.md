@@ -34,6 +34,8 @@ Always start the app via `start.sh`:
 
 When you click Start Ralph (or call `POST /api/ralph/start`), the backend launches `ralph.sh` to run Codex iterations in a git worktree created for the task branch.
 Ralph reads and updates `prd.json`/`progress.txt` from this repo, and the workspace path must point to a valid git repository.
+New task branches are created from the latest `dev` fetched from the default remote (origin when available).
+AI task generation uses the workspace repo README for context when `workspacePath` is set; otherwise it falls back to this repo README.
 Worktrees are created under a sibling folder named `<repo>-worktrees`, and `.env`/`.env.*` files are copied into each worktree.
 `ralph.sh` runs Codex non-interactively with approvals bypassed so runs do not pause for follow-ups.
 
