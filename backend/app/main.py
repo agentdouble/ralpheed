@@ -8,7 +8,8 @@ import shlex
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -25,6 +26,25 @@ DEFAULT_BRANCH_NAME = "ralph/feature"
 DEFAULT_AGENT_ID = "agent-1"
 DEFAULT_AGENT_NAME = "Ralph"
 MAX_LOG_LINES = 220
+ACCEPTANCE_CRITERIA_MIN = 2
+ACCEPTANCE_CRITERIA_MAX = 6
+ACCEPTANCE_TIMEOUT_SECONDS = 120
+ACCEPTANCE_MODEL = "gpt-5.2-codex"
+ACCEPTANCE_REASONING_EFFORT = "low"
+AI_TASKS_DEFAULT_COUNT = 3
+AI_TASKS_MAX = 8
+AI_TASKS_TIMEOUT_SECONDS = 180
+AI_TASKS_MODEL = "gpt-5.2-codex"
+AI_TASKS_REASONING_EFFORT = "low"
+AI_TASKS_CONTEXT_MAX_CHARS = 2400
+AI_TASKS_EXISTING_LIMIT = 40
+ACCEPTANCE_NOISE_PREFIXES = (
+    "OpenAI Codex",
+    "workdir:",
+    "model:",
+    "provider:",
+    "approval:",
+)
 
 load_dotenv(dotenv_path=ROOT_DIR / ".env", override=False)
 
@@ -92,7 +112,8 @@ class AgentBoard:
     task_sequence: int
     agent: AgentState
     logs: list[str]
-    worker: asyncio.Task[None] | None = None
+    ralph_worker: asyncio.Task[None] | None = None
+    openpr_workers: dict[str, asyncio.Task[None]] = field(default_factory=dict)
 
 
 class TaskResponse(BaseModel):
@@ -172,6 +193,23 @@ class StartRalphRequest(BaseModel):
     iterations: int | None = Field(default=None, ge=1)
 
 
+class AcceptanceCriteriaRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=180)
+
+
+class AcceptanceCriteriaResponse(BaseModel):
+    criteria: list[str]
+
+
+class AiTasksRequest(BaseModel):
+    count: int = Field(default=AI_TASKS_DEFAULT_COUNT, ge=1, le=AI_TASKS_MAX)
+    theme: str | None = Field(default=None, max_length=200)
+
+
+class AiTasksResponse(BaseModel):
+    tasks: list[TaskResponse]
+
+
 AGENTS: dict[str, AgentBoard] = {}
 AGENT_ORDER: list[str] = []
 AGENT_SEQUENCE = 1
@@ -208,6 +246,366 @@ def _normalize_acceptance(raw: object) -> list[str]:
         if value:
             cleaned.append(value)
     return cleaned
+
+
+def _build_acceptance_prompt(title: str) -> str:
+    return (
+        "You are an Acceptance Criteria Generator to test whether an implementation matches expectations and works.\n"
+        "Write 2 to 6 acceptance criteria that are 100% AI-verifiable.\n"
+        "Rules:\n"
+        "1) Each criterion is a single, atomic verification.\n"
+        "2) No human judgment required.\n"
+        "3) No vague wording (e.g. \"clean UI\", \"works\", \"optimized\", \"fast\").\n"
+        "Output ONLY a JSON array of strings. No markdown, no numbering.\n"
+        "Use the same language as the title.\n"
+        f"Title: {title}\n"
+    )
+
+
+def _clean_acceptance_items(items: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        value = item.strip()
+        if not value or value in seen:
+            continue
+        if value.startswith(ACCEPTANCE_NOISE_PREFIXES):
+            continue
+        if not value.strip("-"):
+            continue
+        cleaned.append(value)
+        seen.add(value)
+    return cleaned
+
+
+def _parse_acceptance_output(raw: str) -> list[str]:
+    text = raw.strip()
+    if not text:
+        return []
+
+    fenced = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    json_match = re.search(r"\[[\s\S]*\]", text)
+    if json_match:
+        candidate = json_match.group(0)
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, list):
+            items = [item for item in data if isinstance(item, str)]
+            cleaned = _clean_acceptance_items(items)
+            if cleaned:
+                return cleaned
+
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("```"):
+            continue
+        stripped = re.sub(r"^[-*\\d+.\\)]\\s*", "", stripped).strip()
+        if stripped:
+            lines.append(stripped)
+    return _clean_acceptance_items(lines)
+
+
+async def _generate_acceptance_criteria(title: str) -> list[str]:
+    if not shutil.which("codex"):
+        raise HTTPException(status_code=500, detail="codex not found")
+
+    proc: asyncio.subprocess.Process | None = None
+    output_path: str | None = None
+    stdout = b""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            output_path = tmp.name
+        proc = await asyncio.create_subprocess_exec(
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-m",
+            ACCEPTANCE_MODEL,
+            "-c",
+            f'model_reasoning_effort="{ACCEPTANCE_REASONING_EFFORT}"',
+            "--output-last-message",
+            output_path,
+            _build_acceptance_prompt(title),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(ROOT_DIR),
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=ACCEPTANCE_TIMEOUT_SECONDS)
+        if proc.returncode != 0:
+            raise HTTPException(status_code=502, detail="Acceptance criteria generation failed")
+
+        message_text = ""
+        if output_path:
+            try:
+                message_text = Path(output_path).read_text(encoding="utf-8")
+            except OSError:
+                message_text = ""
+
+        criteria_source = message_text.strip()
+        if not criteria_source:
+            criteria_source = stdout.decode(errors="replace").strip() if stdout else ""
+
+        criteria = _parse_acceptance_output(criteria_source)
+        if len(criteria) > ACCEPTANCE_CRITERIA_MAX:
+            criteria = criteria[:ACCEPTANCE_CRITERIA_MAX]
+        if len(criteria) < ACCEPTANCE_CRITERIA_MIN:
+            raise HTTPException(status_code=502, detail="Acceptance criteria generation failed")
+        return criteria
+    except asyncio.TimeoutError as exc:
+        if proc and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 3)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        raise HTTPException(status_code=504, detail="Acceptance criteria generation timed out") from exc
+    except asyncio.CancelledError:
+        if proc and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 3)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        raise
+    finally:
+        if output_path:
+            try:
+                Path(output_path).unlink()
+            except OSError:
+                pass
+
+
+def _read_readme_excerpt() -> str:
+    readme_path = ROOT_DIR / "README.md"
+    if not readme_path.is_file():
+        return ""
+    try:
+        text = readme_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    text = text.strip()
+    if not text:
+        return ""
+    if len(text) > AI_TASKS_CONTEXT_MAX_CHARS:
+        text = text[:AI_TASKS_CONTEXT_MAX_CHARS].rstrip()
+    return text
+
+
+def _build_ai_tasks_prompt(count: int, theme: str, readme: str, existing_titles: list[str]) -> str:
+    theme_line = f"Theme: {theme}" if theme else "Theme: (infer from project context)"
+    existing = ""
+    if existing_titles:
+        trimmed = existing_titles[:AI_TASKS_EXISTING_LIMIT]
+        existing = f"Existing tasks: {json.dumps(trimmed, ensure_ascii=True)}\n"
+    if readme:
+        context = f"Project context (README excerpt):\n{readme}\n"
+    else:
+        context = "Project context: (README unavailable)\n"
+    return (
+        "You are a product manager creating backlog tasks for this project.\n"
+        f"Generate {count} tasks.\n"
+        f"{theme_line}\n"
+        f"{context}"
+        f"{existing}"
+        "Rules:\n"
+        "1) Output ONLY a JSON array of objects.\n"
+        '2) Each object: {"title": string, "notes": string, "priority": 1-3, "status": "backlog"}.\n'
+        "3) Titles must be short and specific.\n"
+        "4) Avoid duplicates of existing tasks.\n"
+        "5) Use the same language as the theme if provided; otherwise use the README language.\n"
+    )
+
+
+def _parse_ai_tasks_output(raw: str) -> list[object]:
+    text = raw.strip()
+    if not text:
+        return []
+
+    fenced = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    json_match = re.search(r"\[[\s\S]*\]", text)
+    if json_match:
+        candidate = json_match.group(0)
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, list):
+            return data
+
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("```"):
+            continue
+        stripped = re.sub(r"^[-*\d+.\)]\s*", "", stripped).strip()
+        if stripped:
+            lines.append(stripped)
+    return lines
+
+
+def _title_key(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def _clean_task_title(raw: object) -> str:
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip()
+    if not value:
+        return ""
+    for prefix in ACCEPTANCE_NOISE_PREFIXES:
+        if value.startswith(prefix):
+            return ""
+    value = re.sub(r"^[-*\d+.\)]\s*", "", value).strip()
+    if not value:
+        return ""
+    if len(value) > 180:
+        value = value[:180].rstrip()
+    return value
+
+
+def _clean_task_notes(raw: object) -> str:
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip()
+    if not value:
+        return ""
+    if len(value) > 2_000:
+        value = value[:2_000].rstrip()
+    return value
+
+
+def _clean_ai_tasks(
+    items: list[object],
+    existing_titles: list[str],
+    count: int,
+) -> list[dict[str, object]]:
+    existing_keys = {_title_key(title) for title in existing_titles if isinstance(title, str) and title.strip()}
+    cleaned: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    for item in items:
+        title = ""
+        notes = ""
+        priority = 1
+        status: TaskStatus = "backlog"
+
+        if isinstance(item, dict):
+            title = _clean_task_title(item.get("title") or item.get("name") or item.get("task") or "")
+            notes = _clean_task_notes(item.get("notes") or item.get("description") or "")
+            priority = _normalize_priority(item.get("priority"))
+            status = _normalize_status(item.get("status"))
+        elif isinstance(item, str):
+            title = _clean_task_title(item)
+        else:
+            continue
+
+        if not title:
+            continue
+        key = _title_key(title)
+        if key in seen or key in existing_keys:
+            continue
+        cleaned.append(
+            {
+                "title": title,
+                "notes": notes,
+                "priority": priority,
+                "status": status,
+            }
+        )
+        seen.add(key)
+        if len(cleaned) >= count:
+            break
+
+    return cleaned
+
+
+async def _generate_ai_tasks(count: int, theme: str, existing_titles: list[str]) -> list[dict[str, object]]:
+    if not shutil.which("codex"):
+        raise HTTPException(status_code=500, detail="codex not found")
+
+    proc: asyncio.subprocess.Process | None = None
+    output_path: str | None = None
+    stdout = b""
+    readme = _read_readme_excerpt()
+    prompt = _build_ai_tasks_prompt(count, theme, readme, existing_titles)
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            output_path = tmp.name
+        proc = await asyncio.create_subprocess_exec(
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-m",
+            AI_TASKS_MODEL,
+            "-c",
+            f'model_reasoning_effort="{AI_TASKS_REASONING_EFFORT}"',
+            "--output-last-message",
+            output_path,
+            prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(ROOT_DIR),
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=AI_TASKS_TIMEOUT_SECONDS)
+        if proc.returncode != 0:
+            raise HTTPException(status_code=502, detail="AI task generation failed")
+
+        message_text = ""
+        if output_path:
+            try:
+                message_text = Path(output_path).read_text(encoding="utf-8")
+            except OSError:
+                message_text = ""
+
+        response_text = message_text.strip()
+        if not response_text:
+            response_text = stdout.decode(errors="replace").strip() if stdout else ""
+
+        items = _parse_ai_tasks_output(response_text)
+        cleaned = _clean_ai_tasks(items, existing_titles, count)
+        if not cleaned:
+            raise HTTPException(status_code=502, detail="AI task generation failed")
+        return cleaned
+    except asyncio.TimeoutError as exc:
+        if proc and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 3)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        raise HTTPException(status_code=504, detail="AI task generation timed out") from exc
+    except asyncio.CancelledError:
+        if proc and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 3)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        raise
+    finally:
+        if output_path:
+            try:
+                Path(output_path).unlink()
+            except OSError:
+                pass
 
 
 def _normalize_priority(raw: object) -> int:
@@ -315,7 +713,7 @@ def _persist_prd() -> None:
 
 
 def _any_worker_running() -> bool:
-    return any(board.worker and not board.worker.done() for board in AGENTS.values())
+    return any(board.ralph_worker and not board.ralph_worker.done() for board in AGENTS.values())
 
 
 def _ensure_mutation_allowed() -> None:
@@ -406,17 +804,14 @@ def _escape_osascript(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _launch_codex_terminal(worktree_path: Path) -> tuple[bool, str]:
-    if not shutil.which("codex"):
-        return False, "codex not found"
-
-    command = f"cd {shlex.quote(str(worktree_path))} && codex"
+def _launch_terminal_command(worktree_path: Path, command: str) -> tuple[bool, str]:
+    full_command = f"cd {shlex.quote(str(worktree_path))} && {command}"
     if sys.platform == "darwin":
         script = (
             'tell application "iTerm"\n'
             "activate\n"
             "set newWindow to (create window with default profile)\n"
-            f'tell current session of newWindow to write text "{_escape_osascript(command)}"\n'
+            f'tell current session of newWindow to write text "{_escape_osascript(full_command)}"\n'
             "end tell"
         )
         result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
@@ -435,18 +830,33 @@ def _launch_codex_terminal(worktree_path: Path) -> tuple[bool, str]:
         if not terminal:
             return False, "no terminal available"
         if terminal.endswith("gnome-terminal"):
-            args = [terminal, "--", "bash", "-lc", command]
+            args = [terminal, "--", "bash", "-lc", full_command]
         else:
-            args = [terminal, "-e", "bash", "-lc", command]
+            args = [terminal, "-e", "bash", "-lc", full_command]
         subprocess.Popen(args, cwd=str(worktree_path))
         return True, ""
 
     if sys.platform == "win32":
-        args = ["cmd", "/c", "start", "cmd", "/k", f"cd /d {worktree_path} && codex"]
+        args = ["cmd", "/c", "start", "cmd", "/k", f"cd /d {worktree_path} && {command}"]
         subprocess.Popen(args)
         return True, ""
 
     return False, "unsupported platform"
+
+
+def _launch_codex_terminal(worktree_path: Path) -> tuple[bool, str]:
+    if not shutil.which("codex"):
+        return False, "codex not found"
+    return _launch_terminal_command(worktree_path, "codex")
+
+
+def _launch_start_terminal(worktree_path: Path) -> tuple[bool, str]:
+    start_script = worktree_path / "start.sh"
+    if not start_script.is_file():
+        return False, "start.sh not found"
+    if not os.access(start_script, os.X_OK):
+        return False, "start.sh not executable"
+    return _launch_terminal_command(worktree_path, "./start.sh")
 
 
 def _resolve_codex_prompt(name: str) -> tuple[str | None, Path | None]:
@@ -558,8 +968,6 @@ def _load_tasks_from_stories(stories: list[object]) -> tuple[dict[str, TaskState
         passes = raw.get("passes") is True
         notes = str(raw.get("notes") or "")
         status = _normalize_status(raw.get("status"))
-        if passes and status != "done":
-            status = "review"
         owner = str(raw.get("owner") or "")
         effort = str(raw.get("effort") or "")
         branch = str(raw.get("branch") or "")
@@ -772,15 +1180,16 @@ def _next_agent_id() -> str:
 
 
 def _start_worker(board: AgentBoard, iterations: int | None = None) -> None:
-    if board.worker and not board.worker.done():
+    if board.ralph_worker and not board.ralph_worker.done():
         return
-    board.worker = asyncio.create_task(_agent_worker_loop(board.id, iterations))
+    board.ralph_worker = asyncio.create_task(_agent_worker_loop(board.id, iterations))
 
 
 def _start_openpr_worker(board: AgentBoard, task_id: str) -> None:
-    if board.worker and not board.worker.done():
+    existing = board.openpr_workers.get(task_id)
+    if existing and not existing.done():
         return
-    board.worker = asyncio.create_task(_openpr_worker_loop(board.id, task_id))
+    board.openpr_workers[task_id] = asyncio.create_task(_openpr_worker_loop(board.id, task_id))
 
 
 async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> None:
@@ -910,7 +1319,7 @@ async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> No
                             board = AGENTS.get(agent_id)
                             if not board:
                                 continue
-                            _append_log(board, text)
+                            _append_log(board, f"RALPH_OUT - {text}")
 
                 return_code = await proc.wait()
 
@@ -924,6 +1333,17 @@ async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> No
                         _append_log(board, f"RALPH_REQUEUE - {task_id} still todo")
                     _append_log(board, f"RALPH_DONE - {task_id} exit {return_code}")
                     _set_agent_running(board, None)
+    except asyncio.CancelledError:
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if board:
+                task_id = board.agent.current_task_id or ""
+                if task_id:
+                    _append_log(board, f"RALPH_CUT - {task_id}")
+                else:
+                    _append_log(board, "RALPH_CUT - canceled")
+                _set_agent_waiting(board)
+        raise
     except Exception as exc:  # pragma: no cover
         async with STATE_LOCK:
             board = AGENTS.get(agent_id)
@@ -952,18 +1372,15 @@ async def _openpr_worker_loop(agent_id: str, task_id: str) -> None:
                 return
             task = board.tasks.get(task_id)
             if not task:
-                _append_log(board, f"OPENPR_ERROR - Task not found {task_id}")
-                _set_agent_waiting(board)
+                _append_log(board, f"OPENPR_ERROR - {task_id} Task not found")
                 return
-            if task.status != "review":
+            if task.status not in {"review", "done"}:
                 _append_log(board, f"OPENPR_ERROR - {task.id} not in review")
-                _set_agent_waiting(board)
                 return
 
             workspace_path = _resolve_workspace_path(board)
             if not workspace_path:
                 _append_log(board, "WORKSPACE_INVALID - Set a valid workspace path before starting.")
-                _set_agent_waiting(board)
                 return
 
             branch = task.branch.strip() or _default_branch_for_task(task)
@@ -973,7 +1390,6 @@ async def _openpr_worker_loop(agent_id: str, task_id: str) -> None:
                 _append_log(board, f"BRANCH_SET - {task.id} {branch}")
                 _persist_prd()
 
-            _set_agent_running(board, task.id)
             _append_log(board, f"OPENPR_START - {task.id} on {branch}")
 
         repo_root = await asyncio.to_thread(_resolve_repo_root, workspace_path)
@@ -983,7 +1399,6 @@ async def _openpr_worker_loop(agent_id: str, task_id: str) -> None:
                 if not board:
                     return
                 _append_log(board, "WORKSPACE_INVALID - Not a git repository")
-                _set_agent_waiting(board)
             return
 
         worktree_path, error = await _ensure_worktree_path(repo_root, branch)
@@ -993,7 +1408,6 @@ async def _openpr_worker_loop(agent_id: str, task_id: str) -> None:
                 if not board:
                     return
                 _append_log(board, f"WORKTREE_ERROR - {error}")
-                _set_agent_waiting(board)
             return
 
         copied = _copy_env_files(repo_root, worktree_path)
@@ -1008,9 +1422,9 @@ async def _openpr_worker_loop(agent_id: str, task_id: str) -> None:
                     _append_log(board, f"ENV_SYNC - {', '.join(copied)}")
                 _append_log(board, f"OPENPR_RUNNING - {task_id} in {worktree_path}")
                 if prompt_path:
-                    _append_log(board, f"OPENPR_PROMPT - {prompt_path}")
+                    _append_log(board, f"OPENPR_PROMPT - {task_id} {prompt_path}")
                 else:
-                    _append_log(board, "OPENPR_PROMPT - /prompts:openpr")
+                    _append_log(board, f"OPENPR_PROMPT - {task_id} /prompts:openpr")
 
         proc = await asyncio.create_subprocess_exec(
             "codex",
@@ -1041,7 +1455,7 @@ async def _openpr_worker_loop(agent_id: str, task_id: str) -> None:
                     board = AGENTS.get(agent_id)
                     if not board:
                         continue
-                    _append_log(board, text)
+                    _append_log(board, f"OPENPR_OUT - {task_id} {text}")
 
         return_code = await proc.wait()
         async with STATE_LOCK:
@@ -1049,15 +1463,19 @@ async def _openpr_worker_loop(agent_id: str, task_id: str) -> None:
             if not board:
                 return
             _sync_board_from_prd(board)
-            _set_agent_waiting(board)
             _append_log(board, f"OPENPR_DONE - {task_id} exit {return_code}")
+    except asyncio.CancelledError:
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if board:
+                _append_log(board, f"OPENPR_CUT - {task_id}")
+        raise
     except Exception as exc:  # pragma: no cover
         async with STATE_LOCK:
             board = AGENTS.get(agent_id)
             if not board:
                 return
-            _append_log(board, f"OPENPR_ERROR - {exc.__class__.__name__}: {exc}")
-            _set_agent_waiting(board)
+            _append_log(board, f"OPENPR_ERROR - {task_id} {exc.__class__.__name__}: {exc}")
     finally:
         if proc and proc.returncode is None:
             proc.terminate()
@@ -1066,6 +1484,10 @@ async def _openpr_worker_loop(agent_id: str, task_id: str) -> None:
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if board:
+                board.openpr_workers.pop(task_id, None)
 
 
 _load_prd_state()
@@ -1122,6 +1544,76 @@ async def update_workspace(payload: WorkspaceRequest, agent_id: str | None = Non
         return _board_state_response(board)
 
 
+@app.post("/api/acceptance-criteria", response_model=AcceptanceCriteriaResponse)
+async def generate_acceptance_criteria(payload: AcceptanceCriteriaRequest) -> AcceptanceCriteriaResponse:
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    criteria = await _generate_acceptance_criteria(title)
+    return AcceptanceCriteriaResponse(criteria=criteria)
+
+
+@app.post("/api/tasks/ai", response_model=AiTasksResponse)
+async def create_ai_tasks(payload: AiTasksRequest, agent_id: str | None = None) -> AiTasksResponse:
+    theme = payload.theme.strip() if payload.theme else ""
+    count = payload.count
+
+    async with STATE_LOCK:
+        _ensure_mutation_allowed()
+        board = _get_board(agent_id)
+        existing_titles = [
+            task.title for task_id in board.order if (task := board.tasks.get(task_id))
+        ]
+
+    candidates = await _generate_ai_tasks(count, theme, existing_titles)
+
+    async with STATE_LOCK:
+        _ensure_mutation_allowed()
+        board = _get_board(agent_id)
+        existing_keys = {_title_key(task.title) for task in board.tasks.values()}
+        created: list[TaskResponse] = []
+
+        for candidate in candidates:
+            title = _clean_task_title(candidate.get("title"))
+            if not title:
+                continue
+            if _title_key(title) in existing_keys:
+                continue
+
+            status = _normalize_status(candidate.get("status"))
+            if status == "done":
+                status = "review"
+
+            now = _utc_now()
+            task_id = _generate_story_id(board)
+            task = TaskState(
+                id=task_id,
+                title=title,
+                acceptance_criteria=[],
+                priority=_normalize_priority(candidate.get("priority")),
+                passes=False,
+                notes=_clean_task_notes(candidate.get("notes")),
+                status=status,
+                owner="",
+                effort="",
+                branch="",
+                commit="",
+                summary="",
+                updated_at=now,
+            )
+            board.tasks[task_id] = task
+            board.order.append(task_id)
+            _append_log(board, f"TASK_CREATED - {task_id} {title}")
+            created.append(_task_to_response(task))
+            existing_keys.add(_title_key(title))
+
+        if not created:
+            raise HTTPException(status_code=502, detail="AI task generation failed")
+
+        _persist_prd()
+        return AiTasksResponse(tasks=created)
+
+
 @app.post("/api/tasks", response_model=TaskResponse)
 async def create_task(payload: CreateTaskRequest, agent_id: str | None = None) -> TaskResponse:
     title = payload.title.strip()
@@ -1139,9 +1631,6 @@ async def create_task(payload: CreateTaskRequest, agent_id: str | None = None) -
         status = payload.status
         if status == "done":
             status = "review"
-        if payload.passes and status != "done":
-            status = "review"
-
         task = TaskState(
             id=task_id,
             title=title,
@@ -1194,7 +1683,7 @@ async def update_task(task_id: str, payload: UpdateTaskRequest, agent_id: str | 
         if payload.status is not None:
             previous_status = task.status
             next_status = payload.status
-            if next_status == "done":
+            if next_status == "done" and previous_status != "done":
                 next_status = "review"
                 _append_log(board, f"STATUS_AUTO - {task.id} done -> review")
 
@@ -1202,10 +1691,6 @@ async def update_task(task_id: str, payload: UpdateTaskRequest, agent_id: str | 
             if previous_status != next_status:
                 _append_log(board, f"STATUS_CHANGE - {task.id} {previous_status} -> {next_status}")
 
-        if payload.passes is True and task.status != "done":
-            if task.status != "review":
-                _append_log(board, f"STATUS_AUTO - {task.id} passes -> review")
-            task.status = "review"
         task.updated_at = _utc_now()
         _persist_prd()
         return _task_to_response(task)
@@ -1244,6 +1729,8 @@ async def review_task(task_id: str, payload: ReviewRequest, agent_id: str | None
             task.status = "done"
             task.passes = True
             _append_log(board, f"REVIEW_APPROVED - {task.id} moved to done")
+            _append_log(board, f"OPENPR_REQUEST - {task.id}")
+            _start_openpr_worker(board, task.id)
         else:
             task.status = "todo"
             task.passes = False
@@ -1259,7 +1746,7 @@ async def open_task_codex(task_id: str, agent_id: str | None = None) -> BoardSta
     async with STATE_LOCK:
         _ensure_mutation_allowed()
         board = _get_board(agent_id)
-        if board.worker and not board.worker.done():
+        if board.ralph_worker and not board.ralph_worker.done():
             raise HTTPException(status_code=409, detail="Ralph is running")
 
         task = board.tasks.get(task_id)
@@ -1307,12 +1794,65 @@ async def open_task_codex(task_id: str, agent_id: str | None = None) -> BoardSta
         return _board_state_response(board)
 
 
+@app.post("/api/tasks/{task_id}/start", response_model=BoardStateResponse)
+async def open_task_start(task_id: str, agent_id: str | None = None) -> BoardStateResponse:
+    async with STATE_LOCK:
+        _ensure_mutation_allowed()
+        board = _get_board(agent_id)
+        if board.ralph_worker and not board.ralph_worker.done():
+            raise HTTPException(status_code=409, detail="Ralph is running")
+
+        task = board.tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task.status != "review":
+            raise HTTPException(status_code=409, detail="Task is not in review")
+
+        workspace_path = _resolve_workspace_path(board)
+        if not workspace_path:
+            raise HTTPException(status_code=400, detail="Workspace path is required")
+
+        branch = task.branch.strip() or _default_branch_for_task(task)
+        if branch != task.branch:
+            task.branch = branch
+            task.updated_at = _utc_now()
+            _append_log(board, f"BRANCH_SET - {task.id} {branch}")
+            _persist_prd()
+
+    repo_root = await asyncio.to_thread(_resolve_repo_root, workspace_path)
+    if not repo_root:
+        async with STATE_LOCK:
+            board = _get_board(agent_id)
+            _append_log(board, "WORKSPACE_INVALID - Not a git repository")
+            return _board_state_response(board)
+
+    worktree_path, error = await _ensure_worktree_path(repo_root, branch)
+    if not worktree_path:
+        async with STATE_LOCK:
+            board = _get_board(agent_id)
+            _append_log(board, f"WORKTREE_ERROR - {error}")
+            return _board_state_response(board)
+
+    copied = _copy_env_files(repo_root, worktree_path)
+    success, message = _launch_start_terminal(worktree_path)
+
+    async with STATE_LOCK:
+        board = _get_board(agent_id)
+        if copied:
+            _append_log(board, f"ENV_SYNC - {', '.join(copied)}")
+        if success:
+            _append_log(board, f"START_OPEN - {task_id} in {worktree_path}")
+        else:
+            _append_log(board, f"START_ERROR - {message}")
+        return _board_state_response(board)
+
+
 @app.post("/api/tasks/{task_id}/openpr", response_model=BoardStateResponse)
 async def open_task_pr(task_id: str, agent_id: str | None = None) -> BoardStateResponse:
     async with STATE_LOCK:
         _ensure_mutation_allowed()
         board = _get_board(agent_id)
-        if board.worker and not board.worker.done():
+        if board.ralph_worker and not board.ralph_worker.done():
             raise HTTPException(status_code=409, detail="Ralph is running")
 
         task = board.tasks.get(task_id)
@@ -1340,11 +1880,51 @@ async def start_ralph(
             _append_log(board, "WORKSPACE_INVALID - Set a valid workspace path before starting.")
             _set_agent_waiting(board)
             return _board_state_response(board)
-        if board.worker and not board.worker.done():
+        if board.ralph_worker and not board.ralph_worker.done():
             return _board_state_response(board)
 
         _append_log(board, "RALPH_START - Requested")
         _start_worker(board, payload.iterations if payload else None)
+        return _board_state_response(board)
+
+
+@app.post("/api/ralph/stop", response_model=BoardStateResponse)
+async def stop_ralph(agent_id: str | None = None) -> BoardStateResponse:
+    async with STATE_LOCK:
+        board = _get_board(agent_id)
+        if not board.ralph_worker or board.ralph_worker.done():
+            _append_log(board, "RALPH_STOP_NOOP - Not running")
+            return _board_state_response(board)
+        _append_log(board, "RALPH_STOP - Requested")
+        board.ralph_worker.cancel()
+        return _board_state_response(board)
+
+
+@app.post("/api/openpr/stop", response_model=BoardStateResponse)
+async def stop_openpr(agent_id: str | None = None) -> BoardStateResponse:
+    async with STATE_LOCK:
+        board = _get_board(agent_id)
+        if not board.openpr_workers:
+            _append_log(board, "OPENPR_STOP_NOOP - Not running")
+            return _board_state_response(board)
+        _append_log(board, "OPENPR_STOP - Requested")
+        for task_id, worker in list(board.openpr_workers.items()):
+            if worker and not worker.done():
+                worker.cancel()
+                _append_log(board, f"OPENPR_STOP - {task_id}")
+        return _board_state_response(board)
+
+
+@app.post("/api/tasks/{task_id}/openpr/stop", response_model=BoardStateResponse)
+async def stop_openpr_task(task_id: str, agent_id: str | None = None) -> BoardStateResponse:
+    async with STATE_LOCK:
+        board = _get_board(agent_id)
+        worker = board.openpr_workers.get(task_id)
+        if not worker or worker.done():
+            _append_log(board, f"OPENPR_STOP_NOOP - {task_id}")
+            return _board_state_response(board)
+        _append_log(board, f"OPENPR_STOP - {task_id}")
+        worker.cancel()
         return _board_state_response(board)
 
 
@@ -1358,7 +1938,7 @@ async def start_all_agents(
             raise HTTPException(status_code=500, detail="ralph.sh not found")
 
         for board in AGENTS.values():
-            if board.worker and not board.worker.done():
+            if board.ralph_worker and not board.ralph_worker.done():
                 continue
             if not _resolve_workspace_path(board):
                 _append_log(board, "WORKSPACE_INVALID - Set a valid workspace path before starting.")
