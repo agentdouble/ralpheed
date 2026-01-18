@@ -11,7 +11,8 @@ for i in $(seq 1 $MAX_ITERATIONS); do
   echo "═══ Iteration $i ═══"
 
   PROMPT_TEMPLATE="$(cat "$SCRIPT_DIR/prompt.md")"
-  PROMPT="$(printf "%s" "$PROMPT_TEMPLATE" | sed "s|{{CONTROL_ROOT}}|$SCRIPT_DIR|g")"
+  PRD_PATH="${RALPHEED_PRD_PATH:-$HOME/.ralpheed/prd/default/prd.json}"
+  PROMPT="$(printf "%s" "$PROMPT_TEMPLATE" | sed "s|{{CONTROL_ROOT}}|$SCRIPT_DIR|g" | sed "s|{{PRD_PATH}}|$PRD_PATH|g")"
 
   OUTPUT=$(codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -m gpt-5.2-codex \
     -c model_reasoning_effort="xhigh" \

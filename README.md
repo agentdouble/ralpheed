@@ -1,6 +1,6 @@
 # Ralph Integration Desk
 
-Mini dashboard to manage multiple Ralph agents in a kanban flow: queue work per agent, then review and approve/reject. Edit or delete tasks directly from the board. Tasks persist to `prd.json`.
+Mini dashboard to manage multiple Ralph agents in a kanban flow: queue work per agent, then review and approve/reject. Edit or delete tasks directly from the board. Tasks persist to workspace-scoped PRD files.
 
 ## Structure
 - `frontend/`: React + Vite dashboard
@@ -31,9 +31,12 @@ Always start the app via `start.sh`:
 ```
 ./start.sh
 ```
+`start.sh` stops any existing listeners on the backend/frontend ports before starting (uses `lsof` when available).
 
 When you click Start Ralph (or call `POST /api/ralph/start`), the backend launches `ralph.sh` to run Codex iterations in a git worktree created for the task branch.
-Ralph reads and updates `prd.json`/`progress.txt` from this repo, and the workspace path must point to a valid git repository.
+Ralph reads and updates the PRD file for the agent workspace (under `~/.ralpheed/prd/.../prd.json`) plus `progress.txt` from this repo, and the workspace path must point to a valid git repository.
+New task branches are created from the latest `dev` fetched from the default remote (origin when available).
+AI task generation uses the workspace repo README for context when `workspacePath` is set; otherwise it falls back to this repo README.
 Worktrees are created under a sibling folder named `<repo>-worktrees`, and `.env`/`.env.*` files are copied into each worktree.
 `ralph.sh` runs Codex non-interactively with approvals bypassed so runs do not pause for follow-ups.
 
@@ -48,10 +51,10 @@ CORS_ORIGINS=
 ```
 
 ## PRD storage
-The app reads/writes `prd.json`. Multi-agent state is stored under `agents`, each with `id`, `name`, `branchName`, `workspacePath`, and `userStories`. Story ids are auto-generated (`US-###`) and priority defaults to P1. The UI adds optional fields per story (`status`, `owner`, `effort`, `branch`, `commit`, `summary`) to keep board state and Ralph output. Legacy single-agent files are auto-migrated on first write.
+Agents are indexed in `~/.ralpheed/prd/index.json`. Task state is stored per workspace under `~/.ralpheed/prd/<workspace>/prd.json`, where `<workspace>` is derived from the git root of the configured workspace path. When no workspace is set, the agent uses `~/.ralpheed/prd/default/prd.json`. On first run, legacy PRD data is migrated into the workspace files and index. Multi-agent state is stored under `agents`, each with `id`, `name`, `branchName`, `workspacePath`, and `userStories`. Story ids are auto-generated (`US-###`) and priority defaults to P1. The UI adds optional fields per story (`status`, `owner`, `effort`, `branch`, `commit`, `summary`) to keep board state and Ralph output.
 
 ## API quick reference
-- When `agent_id` is omitted, the API uses the first agent in `prd.json`.
+- When `agent_id` is omitted, the API uses the first agent in the index.
 - `GET /api/agents`
 - `POST /api/agents`
 - `GET /api/state?agent_id=agent-1`
@@ -73,6 +76,7 @@ The app reads/writes `prd.json`. Multi-agent state is stored under `agents`, eac
 - `POST /api/tasks/{task_id}/openpr/stop?agent_id=agent-1`
 
 Ralph only processes tasks in `todo`.
+Setting `passes` to true moves a `todo` task to `review` automatically.
 Ralph processes todo tasks in rounds (up to the `iterations` count); tasks that stay `todo` are retried in the next round.
 Approving a review automatically triggers the OpenPR flow (the OpenPR button remains available for manual runs).
 The progress log UI shows per-agent tabs (All, Ralph, OpenPR per task) when corresponding logs exist.
@@ -93,7 +97,8 @@ The AI Tasks button can create backlog tasks from a theme (or project context).
 - `POST /api/agents/start-all`
   - body (optional): `{ "iterations": 10 }`
 
-Note: while Ralph is running, task/workspace mutations return 409 to avoid concurrent writes to `prd.json`.
+Note: while Ralph is running, task/workspace mutations return 409 to avoid concurrent writes to PRD files.
+Note: workspace changes return 409 while OpenPR is running.
 Note: on macOS, the Codex and Start buttons require iTerm to be installed.
 Note: `POST /api/acceptance-criteria` runs Codex in the background and requires the `codex` CLI.
 Note: `POST /api/tasks/ai` runs Codex in the background and requires the `codex` CLI.

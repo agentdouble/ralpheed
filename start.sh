@@ -28,6 +28,38 @@ echo "Frontend URL: http://${FRONTEND_HOST}:${FRONTEND_PORT}"
 echo "API URL:     ${API_BASE_URL}"
 echo
 
+kill_port() {
+  local port="$1"
+  local label="$2"
+
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "lsof not found; skipping ${label} port cleanup (${port})." >&2
+    return 0
+  fi
+
+  local pids
+  pids="$(lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true)"
+  if [ -z "${pids}" ]; then
+    return 0
+  fi
+
+  echo "Stopping ${label} on port ${port} (${pids})"
+  kill ${pids} 2>/dev/null || true
+
+  for _ in {1..10}; do
+    sleep 0.2
+    if [ -z "$(lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true)" ]; then
+      return 0
+    fi
+  done
+
+  echo "Force stopping ${label} on port ${port}"
+  kill -9 ${pids} 2>/dev/null || true
+}
+
+kill_port "${BACKEND_PORT}" "backend"
+kill_port "${FRONTEND_PORT}" "frontend"
+
 backend_pid=""
 frontend_pid=""
 

@@ -5,7 +5,7 @@ markdown
 ## Your Task
 
 1. Read `{{CONTROL_ROOT}}/AGENTS.md`
-2. Read `{{CONTROL_ROOT}}/prd.json`
+2. Read `{{PRD_PATH}}`
 3. Read `{{CONTROL_ROOT}}/progress.txt`
    (check Codebase Patterns first)
 4. Work in the current repo (workspace path)
@@ -16,7 +16,7 @@ markdown
 8. Run typecheck and tests
 9. Update `{{CONTROL_ROOT}}/AGENTS.md` with learnings if needed
 10. Commit: `feat: [ID] - [Title]`
-11. Update `{{CONTROL_ROOT}}/prd.json`: `passes: true`
+11. Update `{{PRD_PATH}}`: `passes: true`
 12. Append learnings to `{{CONTROL_ROOT}}/progress.txt`
 
 ## Progress Format

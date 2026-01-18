@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -20,9 +21,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-PRD_PATH = ROOT_DIR / "prd.json"
+PRD_STORAGE_ROOT = Path.home() / ".ralpheed" / "prd"
+INDEX_PATH = PRD_STORAGE_ROOT / "index.json"
+DEFAULT_PRD_PATH = PRD_STORAGE_ROOT / "default" / "prd.json"
+LEGACY_PRD_PATH = ROOT_DIR / "prd.json"
 RALPH_SCRIPT_PATH = ROOT_DIR / "ralph.sh"
 DEFAULT_BRANCH_NAME = "ralph/feature"
+WORKTREE_BASE_BRANCH = "dev"
 DEFAULT_AGENT_ID = "agent-1"
 DEFAULT_AGENT_NAME = "Ralph"
 MAX_LOG_LINES = 220
@@ -215,6 +220,7 @@ AGENT_ORDER: list[str] = []
 AGENT_SEQUENCE = 1
 
 STATE_LOCK = asyncio.Lock()
+WORKTREE_LOCK = asyncio.Lock()
 
 
 def _utc_now() -> datetime:
@@ -386,8 +392,8 @@ async def _generate_acceptance_criteria(title: str) -> list[str]:
                 pass
 
 
-def _read_readme_excerpt() -> str:
-    readme_path = ROOT_DIR / "README.md"
+def _read_readme_excerpt(root_path: Path) -> str:
+    readme_path = root_path / "README.md"
     if not readme_path.is_file():
         return ""
     try:
@@ -534,14 +540,19 @@ def _clean_ai_tasks(
     return cleaned
 
 
-async def _generate_ai_tasks(count: int, theme: str, existing_titles: list[str]) -> list[dict[str, object]]:
+async def _generate_ai_tasks(
+    count: int,
+    theme: str,
+    existing_titles: list[str],
+    context_root: Path,
+) -> list[dict[str, object]]:
     if not shutil.which("codex"):
         raise HTTPException(status_code=500, detail="codex not found")
 
     proc: asyncio.subprocess.Process | None = None
     output_path: str | None = None
     stdout = b""
-    readme = _read_readme_excerpt()
+    readme = _read_readme_excerpt(context_root)
     prompt = _build_ai_tasks_prompt(count, theme, readme, existing_titles)
     try:
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
@@ -560,7 +571,7 @@ async def _generate_ai_tasks(count: int, theme: str, existing_titles: list[str])
             prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=str(ROOT_DIR),
+            cwd=str(context_root),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=AI_TASKS_TIMEOUT_SECONDS)
         if proc.returncode != 0:
@@ -656,20 +667,81 @@ def _default_agent_name(sequence: int) -> str:
     return f"{DEFAULT_AGENT_NAME} {sequence}"
 
 
-def _read_prd() -> dict[str, object]:
-    if not PRD_PATH.exists():
+def _workspace_slug(workspace_root: Path) -> str:
+    name = workspace_root.name.strip() or "workspace"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "workspace"
+    digest = hashlib.sha256(str(workspace_root).encode("utf-8")).hexdigest()[:10]
+    return f"{safe_name}-{digest}"
+
+
+def _prd_path_for_workspace_root(workspace_root: Path | None) -> Path:
+    if not workspace_root:
+        return DEFAULT_PRD_PATH
+    return PRD_STORAGE_ROOT / _workspace_slug(workspace_root) / "prd.json"
+
+
+def _normalize_workspace_path(raw: str) -> Path | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (ROOT_DIR / path).resolve()
+    return path
+
+
+def _resolve_workspace_root_for_storage(path: str) -> Path | None:
+    candidate = _normalize_workspace_path(path)
+    if not candidate:
+        return None
+    if candidate.is_dir():
+        repo_root = _resolve_repo_root(candidate)
+        return repo_root or candidate
+    return candidate
+
+
+def _prd_path_for_workspace(path: str) -> Path:
+    root = _resolve_workspace_root_for_storage(path)
+    return _prd_path_for_workspace_root(root)
+
+
+def _read_prd_at(path: Path) -> dict[str, object]:
+    if not path.exists():
         return {"agents": []}
-    return json.loads(PRD_PATH.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _write_prd(data: dict[str, object]) -> None:
-    PRD_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = PRD_PATH.with_suffix(".json.tmp")
+def _write_prd_at(path: Path, data: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(".json.tmp")
     temp_path.write_text(
         json.dumps(data, indent=2, ensure_ascii=True) + "\n",
         encoding="utf-8",
     )
-    temp_path.replace(PRD_PATH)
+    temp_path.replace(path)
+
+
+def _extract_agent_items(payload: dict[str, object]) -> list[dict[str, object]]:
+    agents_raw = payload.get("agents")
+    if isinstance(agents_raw, list) and agents_raw:
+        return [item for item in agents_raw if isinstance(item, dict)]
+    return [
+        {
+            "id": DEFAULT_AGENT_ID,
+            "name": DEFAULT_AGENT_NAME,
+            "branchName": payload.get("branchName"),
+            "workspacePath": payload.get("workspacePath"),
+            "userStories": payload.get("userStories"),
+        }
+    ]
+
+
+def _find_agent_entry(payload: dict[str, object], agent_id: str) -> dict[str, object] | None:
+    for item in _extract_agent_items(payload):
+        entry_id = str(item.get("id") or "").strip()
+        if entry_id == agent_id:
+            return item
+    return None
 
 
 def _task_to_story(task: TaskState) -> dict[str, object]:
@@ -689,29 +761,64 @@ def _task_to_story(task: TaskState) -> dict[str, object]:
     }
 
 
-def _persist_prd() -> None:
-    agents_payload: list[dict[str, object]] = []
-    for agent_id in AGENT_ORDER:
-        board = AGENTS.get(agent_id)
-        if not board:
-            continue
-        stories = []
+def _agent_payload(board: AgentBoard, include_tasks: bool) -> dict[str, object]:
+    stories = []
+    if include_tasks:
         for task_id in board.order:
             task = board.tasks.get(task_id)
             if task:
                 stories.append(_task_to_story(task))
-        agents_payload.append(
-            {
-                "id": board.id,
-                "name": board.name,
-                "branchName": board.branch_name,
-                "workspacePath": board.workspace_path,
-                "userStories": stories,
-            }
-        )
-    _write_prd({"agents": agents_payload})
+    return {
+        "id": board.id,
+        "name": board.name,
+        "branchName": board.branch_name,
+        "workspacePath": board.workspace_path,
+        "userStories": stories,
+    }
 
 
+def _persist_prd() -> None:
+    index_agents: list[dict[str, object]] = []
+    workspace_updates: dict[Path, dict[str, dict[str, object]]] = {}
+
+    for agent_id in AGENT_ORDER:
+        board = AGENTS.get(agent_id)
+        if not board:
+            continue
+        index_agents.append(_agent_payload(board, include_tasks=False))
+        workspace_path = _prd_path_for_workspace(board.workspace_path)
+        workspace_updates.setdefault(workspace_path, {})[board.id] = _agent_payload(board, include_tasks=True)
+
+    _write_prd_at(INDEX_PATH, {"agents": index_agents})
+
+    for path, updates in workspace_updates.items():
+        existing_payload = _read_prd_at(path)
+        existing_items = _extract_agent_items(existing_payload)
+        existing_by_id: dict[str, dict[str, object]] = {}
+        for item in existing_items:
+            agent_id = str(item.get("id") or "").strip()
+            if agent_id:
+                existing_by_id[agent_id] = item
+
+        existing_by_id.update(updates)
+
+        ordered: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for item in existing_items:
+            agent_id = str(item.get("id") or "").strip()
+            if not agent_id:
+                continue
+            if agent_id in updates:
+                ordered.append(existing_by_id[agent_id])
+            else:
+                ordered.append(item)
+            seen.add(agent_id)
+        for agent_id, item in existing_by_id.items():
+            if agent_id in seen:
+                continue
+            ordered.append(item)
+
+        _write_prd_at(path, {"agents": ordered})
 def _any_worker_running() -> bool:
     return any(board.ralph_worker and not board.ralph_worker.done() for board in AGENTS.values())
 
@@ -721,16 +828,15 @@ def _ensure_mutation_allowed() -> None:
         raise HTTPException(status_code=409, detail="Ralph is running")
 
 
-def _resolve_workspace_path(board: AgentBoard) -> Path | None:
-    raw = board.workspace_path.strip()
-    if not raw:
-        return None
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        path = (ROOT_DIR / path).resolve()
-    if not path.is_dir():
+def _resolve_workspace_value(raw: str) -> Path | None:
+    path = _normalize_workspace_path(raw)
+    if not path or not path.is_dir():
         return None
     return path
+
+
+def _resolve_workspace_path(board: AgentBoard) -> Path | None:
+    return _resolve_workspace_value(board.workspace_path)
 
 
 def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -745,6 +851,29 @@ def _resolve_repo_root(path: Path) -> Path | None:
     if not root.is_dir():
         return None
     return root
+
+
+def _resolve_workspace_root(path: str) -> Path | None:
+    workspace_path = _resolve_workspace_value(path)
+    if not workspace_path:
+        return None
+    repo_root = _resolve_repo_root(workspace_path)
+    return repo_root or workspace_path
+
+
+def _select_git_remote(repo_root: Path) -> tuple[str | None, str | None]:
+    result = _run_git(["git", "remote"], repo_root)
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "unable to list remotes"
+        return None, error
+    remotes = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not remotes:
+        return None, "no git remotes"
+    if "origin" in remotes:
+        return "origin", None
+    if len(remotes) == 1:
+        return remotes[0], None
+    return None, "multiple remotes without origin"
 
 
 def _worktrees_root(repo_root: Path) -> Path:
@@ -762,42 +891,62 @@ def _default_branch_for_task(task: TaskState) -> str:
     return f"feat/{task.id.lower()}"
 
 
-async def _ensure_worktree_path(repo_root: Path, branch: str) -> tuple[Path | None, str | None]:
-    worktrees_root = _worktrees_root(repo_root)
-    worktrees_root.mkdir(parents=True, exist_ok=True)
-    worktree_path = worktrees_root / _sanitize_branch_name(branch)
-
-    if worktree_path.exists():
-        if not worktree_path.is_dir():
-            return None, f"invalid path {worktree_path}"
-
-        result = await asyncio.to_thread(
-            _run_git,
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            worktree_path,
-        )
-        if result.returncode != 0:
-            error = result.stderr.strip() or "unable to read worktree"
-            return None, error
-        current_branch = result.stdout.strip()
-        if current_branch != branch:
-            return None, f"{worktree_path} on {current_branch}, expected {branch}"
-        return worktree_path, None
-
-    exists_result = await asyncio.to_thread(
-        _run_git,
-        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-        repo_root,
-    )
-    if exists_result.returncode == 0:
-        cmd = ["git", "worktree", "add", str(worktree_path), branch]
-    else:
-        cmd = ["git", "worktree", "add", "-b", branch, str(worktree_path)]
-    result = await asyncio.to_thread(_run_git, cmd, repo_root)
-    if result.returncode != 0:
-        error = (result.stderr or result.stdout).strip() or "unable to create worktree"
+async def _refresh_base_branch(repo_root: Path, base_branch: str) -> tuple[str | None, str | None]:
+    remote, error = await asyncio.to_thread(_select_git_remote, repo_root)
+    if not remote:
         return None, error
-    return worktree_path, None
+    fetch_result = await asyncio.to_thread(_run_git, ["git", "fetch", remote, base_branch], repo_root)
+    if fetch_result.returncode != 0:
+        error = fetch_result.stderr.strip() or fetch_result.stdout.strip() or "unable to fetch base branch"
+        return None, error
+    remote_ref = f"refs/remotes/{remote}/{base_branch}"
+    rev_result = await asyncio.to_thread(_run_git, ["git", "rev-parse", "--verify", remote_ref], repo_root)
+    if rev_result.returncode != 0:
+        error = rev_result.stderr.strip() or rev_result.stdout.strip() or "unable to resolve base branch"
+        return None, error
+    return remote_ref, None
+
+
+async def _ensure_worktree_path(repo_root: Path, branch: str) -> tuple[Path | None, str | None]:
+    async with WORKTREE_LOCK:
+        worktrees_root = _worktrees_root(repo_root)
+        worktrees_root.mkdir(parents=True, exist_ok=True)
+        worktree_path = worktrees_root / _sanitize_branch_name(branch)
+
+        if worktree_path.exists():
+            if not worktree_path.is_dir():
+                return None, f"invalid path {worktree_path}"
+
+            result = await asyncio.to_thread(
+                _run_git,
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                worktree_path,
+            )
+            if result.returncode != 0:
+                error = result.stderr.strip() or "unable to read worktree"
+                return None, error
+            current_branch = result.stdout.strip()
+            if current_branch != branch:
+                return None, f"{worktree_path} on {current_branch}, expected {branch}"
+            return worktree_path, None
+
+        exists_result = await asyncio.to_thread(
+            _run_git,
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            repo_root,
+        )
+        if exists_result.returncode == 0:
+            cmd = ["git", "worktree", "add", str(worktree_path), branch]
+        else:
+            base_ref, error = await _refresh_base_branch(repo_root, WORKTREE_BASE_BRANCH)
+            if not base_ref:
+                return None, error
+            cmd = ["git", "worktree", "add", "-b", branch, str(worktree_path), base_ref]
+        result = await asyncio.to_thread(_run_git, cmd, repo_root)
+        if result.returncode != 0:
+            error = (result.stderr or result.stdout).strip() or "unable to create worktree"
+            return None, error
+        return worktree_path, None
 
 
 def _escape_osascript(value: str) -> str:
@@ -902,53 +1051,25 @@ def _select_task_for_run(board: AgentBoard) -> TaskState | None:
 
 
 def _sync_board_from_prd(board: AgentBoard) -> None:
-    data = _read_prd()
-    agents_raw = data.get("agents")
-    if isinstance(agents_raw, list) and agents_raw:
-        agent_items = agents_raw
-    else:
-        agent_items = [
-            {
-                "id": DEFAULT_AGENT_ID,
-                "name": DEFAULT_AGENT_NAME,
-                "branchName": data.get("branchName"),
-                "workspacePath": data.get("workspacePath"),
-                "userStories": data.get("userStories"),
-            }
-        ]
-
-    for index, raw in enumerate(agent_items, start=1):
-        if not isinstance(raw, dict):
-            continue
-        raw_id = str(raw.get("id") or "").strip()
-        agent_id = raw_id or (DEFAULT_AGENT_ID if index == 1 else f"agent-{index}")
-        if agent_id != board.id:
-            continue
-
-        raw_name = str(raw.get("name") or "").strip()
-        sequence = _extract_agent_sequence(agent_id) or index
-        name = raw_name or _default_agent_name(sequence)
-
-        branch_raw = raw.get("branchName")
-        if isinstance(branch_raw, str) and branch_raw.strip():
-            branch_name = branch_raw.strip()
-        else:
-            branch_name = DEFAULT_BRANCH_NAME
-
-        workspace_raw = raw.get("workspacePath")
-        workspace_path = workspace_raw if isinstance(workspace_raw, str) else ""
-
-        stories_raw = raw.get("userStories")
-        stories = stories_raw if isinstance(stories_raw, list) else []
-
-        tasks, order, sequence = _load_tasks_from_stories(stories)
-        board.name = name
-        board.branch_name = branch_name
-        board.workspace_path = workspace_path
-        board.tasks = tasks
-        board.order = order
-        board.task_sequence = sequence
+    payload = _read_prd_at(_prd_path_for_workspace(board.workspace_path))
+    entry = _find_agent_entry(payload, board.id)
+    if not entry:
         return
+
+    stories_raw = entry.get("userStories")
+    stories = stories_raw if isinstance(stories_raw, list) else []
+    tasks, order, sequence = _load_tasks_from_stories(stories)
+    board.tasks = tasks
+    board.order = order
+    board.task_sequence = sequence
+
+    branch_raw = entry.get("branchName")
+    if isinstance(branch_raw, str) and branch_raw.strip():
+        board.branch_name = branch_raw.strip()
+
+    name_raw = entry.get("name")
+    if not board.name and isinstance(name_raw, str) and name_raw.strip():
+        board.name = name_raw.strip()
 
 
 def _load_tasks_from_stories(stories: list[object]) -> tuple[dict[str, TaskState], list[str], int]:
@@ -997,6 +1118,38 @@ def _load_tasks_from_stories(stories: list[object]) -> tuple[dict[str, TaskState
     return tasks, order, sequence
 
 
+def _apply_stories_to_board(board: AgentBoard, stories: list[object]) -> None:
+    tasks, order, sequence = _load_tasks_from_stories(stories)
+    board.tasks = tasks
+    board.order = order
+    board.task_sequence = sequence
+
+
+def _merge_stories(primary: list[object], fallback: list[object]) -> list[object]:
+    merged: list[object] = []
+    seen: set[str] = set()
+
+    for item in primary:
+        if not isinstance(item, dict):
+            continue
+        story_id = str(item.get("id") or "").strip()
+        if not story_id or story_id in seen:
+            continue
+        merged.append(item)
+        seen.add(story_id)
+
+    for item in fallback:
+        if not isinstance(item, dict):
+            continue
+        story_id = str(item.get("id") or "").strip()
+        if not story_id or story_id in seen:
+            continue
+        merged.append(item)
+        seen.add(story_id)
+
+    return merged
+
+
 def _create_board(
     agent_id: str,
     name: str,
@@ -1027,26 +1180,30 @@ def _create_board(
 def _load_prd_state() -> None:
     global AGENTS, AGENT_ORDER, AGENT_SEQUENCE
 
-    data = _read_prd()
-    agents_raw = data.get("agents")
-    if isinstance(agents_raw, list) and agents_raw:
-        agent_items = agents_raw
+    used_legacy = False
+    if INDEX_PATH.exists():
+        index_data = _read_prd_at(INDEX_PATH)
+    elif DEFAULT_PRD_PATH.exists():
+        index_data = _read_prd_at(DEFAULT_PRD_PATH)
+        used_legacy = True
+    elif LEGACY_PRD_PATH.exists():
+        index_data = _read_prd_at(LEGACY_PRD_PATH)
+        used_legacy = True
     else:
-        agent_items = [
-            {
-                "id": DEFAULT_AGENT_ID,
-                "name": DEFAULT_AGENT_NAME,
-                "branchName": data.get("branchName"),
-                "workspacePath": data.get("workspacePath"),
-                "userStories": data.get("userStories"),
-            }
-        ]
+        index_data = {"agents": []}
+
+    index_items = _extract_agent_items(index_data)
+    index_by_id: dict[str, dict[str, object]] = {}
+    for item in index_items:
+        agent_id = str(item.get("id") or "").strip()
+        if agent_id:
+            index_by_id[agent_id] = item
 
     agents: dict[str, AgentBoard] = {}
     order: list[str] = []
     highest = 0
 
-    for index, raw in enumerate(agent_items, start=1):
+    for index, raw in enumerate(index_items, start=1):
         if not isinstance(raw, dict):
             continue
         raw_id = str(raw.get("id") or "").strip()
@@ -1057,16 +1214,11 @@ def _load_prd_state() -> None:
         sequence = _extract_agent_sequence(agent_id) or index
         name = raw_name or _default_agent_name(sequence)
         branch_raw = raw.get("branchName")
-        if isinstance(branch_raw, str) and branch_raw.strip():
-            branch_name = branch_raw.strip()
-        else:
-            branch_name = DEFAULT_BRANCH_NAME
+        branch_name = branch_raw.strip() if isinstance(branch_raw, str) and branch_raw.strip() else DEFAULT_BRANCH_NAME
         workspace_raw = raw.get("workspacePath")
         workspace_path = workspace_raw if isinstance(workspace_raw, str) else ""
-        stories_raw = raw.get("userStories")
-        stories = stories_raw if isinstance(stories_raw, list) else []
 
-        board = _create_board(agent_id, name, branch_name, workspace_path, stories)
+        board = _create_board(agent_id, name, branch_name, workspace_path, [])
         agents[agent_id] = board
         order.append(agent_id)
         highest = max(highest, _extract_agent_sequence(agent_id))
@@ -1080,6 +1232,43 @@ def _load_prd_state() -> None:
     AGENTS = agents
     AGENT_ORDER = order
     AGENT_SEQUENCE = highest + 1 if highest else len(order) + 1
+
+    migrated = used_legacy or not INDEX_PATH.exists()
+
+    for board in AGENTS.values():
+        workspace_payload = _read_prd_at(_prd_path_for_workspace(board.workspace_path))
+        entry = _find_agent_entry(workspace_payload, board.id)
+        entry_stories_raw = entry.get("userStories") if entry else None
+        entry_stories = entry_stories_raw if isinstance(entry_stories_raw, list) else []
+        fallback = index_by_id.get(board.id)
+        fallback_stories_raw = fallback.get("userStories") if fallback else None
+        fallback_stories = fallback_stories_raw if isinstance(fallback_stories_raw, list) else []
+
+        if used_legacy and fallback_stories:
+            merged = _merge_stories(entry_stories, fallback_stories) if entry else fallback_stories
+            _apply_stories_to_board(board, merged)
+            if merged != entry_stories:
+                migrated = True
+            branch_raw = entry.get("branchName") if entry else None
+            if not (isinstance(branch_raw, str) and branch_raw.strip()):
+                branch_raw = fallback.get("branchName") if fallback else None
+            if isinstance(branch_raw, str) and branch_raw.strip():
+                board.branch_name = branch_raw.strip()
+            continue
+
+        if entry:
+            _apply_stories_to_board(board, entry_stories)
+            branch_raw = entry.get("branchName")
+            if isinstance(branch_raw, str) and branch_raw.strip():
+                board.branch_name = branch_raw.strip()
+            continue
+
+        if fallback_stories:
+            _apply_stories_to_board(board, fallback_stories)
+            migrated = True
+
+    if migrated:
+        _persist_prd()
 
 
 def _task_to_response(task: TaskState) -> TaskResponse:
@@ -1297,6 +1486,7 @@ async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> No
                                 board,
                                 f"RALPH_RUNNING - Script started in {worktree_path} ({iterations} iterations)",
                             )
+                    prd_path = _prd_path_for_workspace(board.workspace_path) if board else DEFAULT_PRD_PATH
 
                 proc = await asyncio.create_subprocess_exec(
                     "/bin/bash",
@@ -1305,6 +1495,7 @@ async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> No
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     cwd=str(worktree_path),
+                    env={**os.environ, "RALPHEED_PRD_PATH": str(prd_path)},
                 )
 
                 if proc.stdout:
@@ -1533,14 +1724,40 @@ async def update_workspace(payload: WorkspaceRequest, agent_id: str | None = Non
     path = payload.path.strip()
     if not path:
         raise HTTPException(status_code=400, detail="Workspace path is required")
+    workspace_root = _resolve_workspace_root(path)
+    if not workspace_root:
+        raise HTTPException(status_code=400, detail="Workspace path is invalid")
 
     async with STATE_LOCK:
         _ensure_mutation_allowed()
+        if any(
+            worker and not worker.done()
+            for board in AGENTS.values()
+            for worker in board.openpr_workers.values()
+        ):
+            raise HTTPException(status_code=409, detail="OpenPR is running")
         board = _get_board(agent_id)
-        if path != board.workspace_path:
-            board.workspace_path = path
-            _append_log(board, f"WORKSPACE_SET - {path}")
-            _persist_prd()
+        if path == board.workspace_path:
+            return _board_state_response(board)
+
+        _persist_prd()
+        board.workspace_path = path
+        _append_log(board, f"WORKSPACE_SET - {path}")
+
+        payload = _read_prd_at(_prd_path_for_workspace(path))
+        entry = _find_agent_entry(payload, board.id)
+        if entry:
+            stories_raw = entry.get("userStories")
+            stories = stories_raw if isinstance(stories_raw, list) else []
+            _apply_stories_to_board(board, stories)
+            branch_raw = entry.get("branchName")
+            if isinstance(branch_raw, str) and branch_raw.strip():
+                board.branch_name = branch_raw.strip()
+        else:
+            _apply_stories_to_board(board, [])
+            board.branch_name = DEFAULT_BRANCH_NAME
+
+        _persist_prd()
         return _board_state_response(board)
 
 
@@ -1564,8 +1781,15 @@ async def create_ai_tasks(payload: AiTasksRequest, agent_id: str | None = None) 
         existing_titles = [
             task.title for task_id in board.order if (task := board.tasks.get(task_id))
         ]
+        workspace_raw = board.workspace_path
 
-    candidates = await _generate_ai_tasks(count, theme, existing_titles)
+    context_root = ROOT_DIR
+    workspace_path = _resolve_workspace_value(workspace_raw)
+    if workspace_path:
+        repo_root = await asyncio.to_thread(_resolve_repo_root, workspace_path)
+        context_root = repo_root or workspace_path
+
+    candidates = await _generate_ai_tasks(count, theme, existing_titles, context_root)
 
     async with STATE_LOCK:
         _ensure_mutation_allowed()
@@ -1680,16 +1904,22 @@ async def update_task(task_id: str, payload: UpdateTaskRequest, agent_id: str | 
         if payload.notes is not None:
             task.notes = payload.notes.strip()
 
+        previous_status = task.status
         if payload.status is not None:
-            previous_status = task.status
             next_status = payload.status
             if next_status == "done" and previous_status != "done":
                 next_status = "review"
                 _append_log(board, f"STATUS_AUTO - {task.id} done -> review")
+        else:
+            next_status = task.status
 
+        if payload.passes is True and next_status == "todo":
+            next_status = "review"
+            _append_log(board, f"STATUS_AUTO - {task.id} passes -> review")
+
+        if previous_status != next_status:
             task.status = next_status
-            if previous_status != next_status:
-                _append_log(board, f"STATUS_CHANGE - {task.id} {previous_status} -> {next_status}")
+            _append_log(board, f"STATUS_CHANGE - {task.id} {previous_status} -> {next_status}")
 
         task.updated_at = _utc_now()
         _persist_prd()
