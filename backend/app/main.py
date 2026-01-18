@@ -92,6 +92,8 @@ class TaskState:
     status: TaskStatus
     owner: str
     effort: str
+    worktree: str
+    wait_for_validation: bool
     branch: str
     commit: str
     summary: str
@@ -131,6 +133,8 @@ class TaskResponse(BaseModel):
     status: TaskStatus
     owner: str
     effort: str
+    worktree: str
+    wait_for_validation: bool
     branch: str
     commit: str
     summary: str
@@ -175,6 +179,8 @@ class CreateTaskRequest(BaseModel):
     passes: bool = False
     notes: str = Field(default="", max_length=2_000)
     status: TaskStatus = "backlog"
+    worktree: str = Field(default="", max_length=120)
+    wait_for_validation: bool = False
 
 
 class UpdateTaskRequest(BaseModel):
@@ -184,6 +190,8 @@ class UpdateTaskRequest(BaseModel):
     passes: bool | None = None
     notes: str | None = Field(default=None, max_length=2_000)
     status: TaskStatus | None = None
+    worktree: str | None = Field(default=None, max_length=120)
+    wait_for_validation: bool | None = None
 
 
 class ReviewRequest(BaseModel):
@@ -252,6 +260,29 @@ def _normalize_acceptance(raw: object) -> list[str]:
         if value:
             cleaned.append(value)
     return cleaned
+
+
+def _normalize_worktree(raw: object) -> str:
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip()
+    if not value:
+        return ""
+    if len(value) > 120:
+        value = value[:120].rstrip()
+    return value
+
+
+def _normalize_wait_for_validation(raw: object) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    return False
 
 
 def _build_acceptance_prompt(title: str) -> str:
@@ -426,10 +457,13 @@ def _build_ai_tasks_prompt(count: int, theme: str, readme: str, existing_titles:
         f"{existing}"
         "Rules:\n"
         "1) Output ONLY a JSON array of objects.\n"
-        '2) Each object: {"title": string, "notes": string, "priority": 1-3, "status": "backlog"}.\n'
+        '2) Each object: {"title": string, "notes": string, "priority": 1-3, "status": "backlog", '
+        '"worktree": string, "wait_for_validation": boolean}.\n'
         "3) Titles must be short and specific.\n"
         "4) Avoid duplicates of existing tasks.\n"
         "5) Use the same language as the theme if provided; otherwise use the README language.\n"
+        "6) If tasks depend on each other, give them the same worktree.\n"
+        "7) Set wait_for_validation=true on the blocking task.\n"
     )
 
 
@@ -509,12 +543,18 @@ def _clean_ai_tasks(
         notes = ""
         priority = 1
         status: TaskStatus = "backlog"
+        worktree = ""
+        wait_for_validation = False
 
         if isinstance(item, dict):
             title = _clean_task_title(item.get("title") or item.get("name") or item.get("task") or "")
             notes = _clean_task_notes(item.get("notes") or item.get("description") or "")
             priority = _normalize_priority(item.get("priority"))
             status = _normalize_status(item.get("status"))
+            worktree = _normalize_worktree(item.get("worktree") or item.get("worktreeGroup"))
+            wait_for_validation = _normalize_wait_for_validation(
+                item.get("wait_for_validation") if "wait_for_validation" in item else item.get("waitForValidation")
+            )
         elif isinstance(item, str):
             title = _clean_task_title(item)
         else:
@@ -531,6 +571,8 @@ def _clean_ai_tasks(
                 "notes": notes,
                 "priority": priority,
                 "status": status,
+                "worktree": worktree,
+                "wait_for_validation": wait_for_validation,
             }
         )
         seen.add(key)
@@ -755,6 +797,8 @@ def _task_to_story(task: TaskState) -> dict[str, object]:
         "status": task.status,
         "owner": task.owner,
         "effort": task.effort,
+        "worktree": task.worktree,
+        "waitForValidation": task.wait_for_validation,
         "branch": task.branch,
         "commit": task.commit,
         "summary": task.summary,
@@ -889,6 +933,15 @@ def _sanitize_branch_name(branch: str) -> str:
 
 def _default_branch_for_task(task: TaskState) -> str:
     return f"feat/{task.id.lower()}"
+
+
+def _resolve_task_branch(task: TaskState) -> str:
+    worktree = task.worktree.strip()
+    if worktree:
+        return worktree
+    if task.branch.strip():
+        return task.branch.strip()
+    return _default_branch_for_task(task)
 
 
 async def _refresh_base_branch(repo_root: Path, base_branch: str) -> tuple[str | None, str | None]:
@@ -1050,6 +1103,43 @@ def _select_task_for_run(board: AgentBoard) -> TaskState | None:
     return best
 
 
+def _task_sort_key(task: TaskState, order_index: dict[str, int]) -> tuple[int, int]:
+    return (task.priority, order_index.get(task.id, 0))
+
+
+def _worktree_sequences(board: AgentBoard, order_index: dict[str, int]) -> dict[str, list[TaskState]]:
+    sequences: dict[str, list[TaskState]] = {}
+    for task_id in board.order:
+        task = board.tasks.get(task_id)
+        if not task:
+            continue
+        worktree = task.worktree.strip()
+        if not worktree:
+            continue
+        sequences.setdefault(worktree, []).append(task)
+    for tasks in sequences.values():
+        tasks.sort(key=lambda item: _task_sort_key(item, order_index))
+    return sequences
+
+
+def _task_blocked_by_validation(
+    task: TaskState,
+    sequences: dict[str, list[TaskState]],
+) -> bool:
+    worktree = task.worktree.strip()
+    if not worktree:
+        return False
+    group = sequences.get(worktree)
+    if not group:
+        return False
+    for sibling in group:
+        if sibling.id == task.id:
+            break
+        if sibling.wait_for_validation and sibling.status not in {"review", "done"}:
+            return True
+    return False
+
+
 def _sync_board_from_prd(board: AgentBoard) -> None:
     payload = _read_prd_at(_prd_path_for_workspace(board.workspace_path))
     entry = _find_agent_entry(payload, board.id)
@@ -1091,7 +1181,13 @@ def _load_tasks_from_stories(stories: list[object]) -> tuple[dict[str, TaskState
         status = _normalize_status(raw.get("status"))
         owner = str(raw.get("owner") or "")
         effort = str(raw.get("effort") or "")
+        worktree = _normalize_worktree(raw.get("worktree") or raw.get("worktreeGroup"))
+        wait_for_validation = _normalize_wait_for_validation(
+            raw.get("waitForValidation") if "waitForValidation" in raw else raw.get("wait_for_validation")
+        )
         branch = str(raw.get("branch") or "")
+        if worktree:
+            branch = worktree
         commit = str(raw.get("commit") or "")
         summary = str(raw.get("summary") or "")
         updated_at = _utc_now()
@@ -1106,6 +1202,8 @@ def _load_tasks_from_stories(stories: list[object]) -> tuple[dict[str, TaskState
             status=status,
             owner=owner,
             effort=effort,
+            worktree=worktree,
+            wait_for_validation=wait_for_validation,
             branch=branch,
             commit=commit,
             summary=summary,
@@ -1282,6 +1380,8 @@ def _task_to_response(task: TaskState) -> TaskResponse:
         status=task.status,
         owner=task.owner,
         effort=task.effort,
+        worktree=task.worktree,
+        wait_for_validation=task.wait_for_validation,
         branch=task.branch,
         commit=task.commit,
         summary=task.summary,
@@ -1423,15 +1523,27 @@ async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> No
                 if not board:
                     return
 
+                order_index = {task_id: index for index, task_id in enumerate(board.order)}
                 todo_ids = [
                     task_id
                     for task_id in board.order
                     if (task := board.tasks.get(task_id)) and task.status == "todo" and not task.passes
                 ]
+                todo_ids.sort(key=lambda item: _task_sort_key(board.tasks[item], order_index))
+                worktree_sequences = _worktree_sequences(board, order_index)
+                eligible_ids = [
+                    task_id
+                    for task_id in todo_ids
+                    if not _task_blocked_by_validation(board.tasks[task_id], worktree_sequences)
+                ]
 
                 if not todo_ids:
                     _set_agent_waiting(board)
                     _append_log(board, "RALPH_WAITING - No todo tasks")
+                    return
+                if not eligible_ids:
+                    _set_agent_waiting(board)
+                    _append_log(board, "RALPH_WAITING - Waiting for review")
                     return
 
                 if round_index >= max_rounds:
@@ -1440,9 +1552,9 @@ async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> No
                     return
 
                 round_index += 1
-                _append_log(board, f"RALPH_ROUND - {round_index}/{max_rounds} ({len(todo_ids)} tasks)")
+                _append_log(board, f"RALPH_ROUND - {round_index}/{max_rounds} ({len(eligible_ids)} tasks)")
 
-            for task_id in todo_ids:
+            for task_id in eligible_ids:
                 async with STATE_LOCK:
                     board = AGENTS.get(agent_id)
                     if not board:
@@ -1452,7 +1564,7 @@ async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> No
                     if not task or task.status != "todo" or task.passes:
                         continue
 
-                    branch = task.branch.strip() or _default_branch_for_task(task)
+                    branch = _resolve_task_branch(task)
                     if branch != task.branch:
                         task.branch = branch
                         task.updated_at = _utc_now()
@@ -1574,7 +1686,7 @@ async def _openpr_worker_loop(agent_id: str, task_id: str) -> None:
                 _append_log(board, "WORKSPACE_INVALID - Set a valid workspace path before starting.")
                 return
 
-            branch = task.branch.strip() or _default_branch_for_task(task)
+            branch = _resolve_task_branch(task)
             if branch != task.branch:
                 task.branch = branch
                 task.updated_at = _utc_now()
@@ -1807,6 +1919,11 @@ async def create_ai_tasks(payload: AiTasksRequest, agent_id: str | None = None) 
             status = _normalize_status(candidate.get("status"))
             if status == "done":
                 status = "review"
+            worktree = _normalize_worktree(candidate.get("worktree"))
+            wait_for_validation = _normalize_wait_for_validation(
+                candidate.get("wait_for_validation") if "wait_for_validation" in candidate else candidate.get("waitForValidation")
+            )
+            branch = worktree if worktree else ""
 
             now = _utc_now()
             task_id = _generate_story_id(board)
@@ -1820,7 +1937,9 @@ async def create_ai_tasks(payload: AiTasksRequest, agent_id: str | None = None) 
                 status=status,
                 owner="",
                 effort="",
-                branch="",
+                worktree=worktree,
+                wait_for_validation=wait_for_validation,
+                branch=branch,
                 commit="",
                 summary="",
                 updated_at=now,
@@ -1845,6 +1964,8 @@ async def create_task(payload: CreateTaskRequest, agent_id: str | None = None) -
         raise HTTPException(status_code=400, detail="Title is required")
 
     acceptance_criteria = _normalize_acceptance(payload.acceptance_criteria)
+    worktree = _normalize_worktree(payload.worktree)
+    branch = worktree if worktree else ""
 
     async with STATE_LOCK:
         _ensure_mutation_allowed()
@@ -1865,7 +1986,9 @@ async def create_task(payload: CreateTaskRequest, agent_id: str | None = None) -
             status=status,
             owner="",
             effort="",
-            branch="",
+            worktree=worktree,
+            wait_for_validation=payload.wait_for_validation,
+            branch=branch,
             commit="",
             summary="",
             updated_at=now,
@@ -1903,6 +2026,18 @@ async def update_task(task_id: str, payload: UpdateTaskRequest, agent_id: str | 
 
         if payload.notes is not None:
             task.notes = payload.notes.strip()
+
+        if payload.worktree is not None:
+            next_worktree = _normalize_worktree(payload.worktree)
+            if next_worktree:
+                task.worktree = next_worktree
+                task.branch = next_worktree
+            elif task.worktree:
+                task.worktree = ""
+                task.branch = ""
+
+        if payload.wait_for_validation is not None:
+            task.wait_for_validation = payload.wait_for_validation
 
         previous_status = task.status
         if payload.status is not None:
@@ -1989,7 +2124,7 @@ async def open_task_codex(task_id: str, agent_id: str | None = None) -> BoardSta
         if not workspace_path:
             raise HTTPException(status_code=400, detail="Workspace path is required")
 
-        branch = task.branch.strip() or _default_branch_for_task(task)
+        branch = _resolve_task_branch(task)
         if branch != task.branch:
             task.branch = branch
             task.updated_at = _utc_now()
@@ -2042,7 +2177,7 @@ async def open_task_start(task_id: str, agent_id: str | None = None) -> BoardSta
         if not workspace_path:
             raise HTTPException(status_code=400, detail="Workspace path is required")
 
-        branch = task.branch.strip() or _default_branch_for_task(task)
+        branch = _resolve_task_branch(task)
         if branch != task.branch:
             task.branch = branch
             task.updated_at = _utc_now()

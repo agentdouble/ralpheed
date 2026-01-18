@@ -811,6 +811,12 @@
   border-color: rgba(34, 197, 94, 0.22);
 }
 
+.meta-chip--gate {
+  background: rgba(234, 88, 12, 0.12);
+  color: rgba(234, 88, 12, 0.85);
+  border-color: rgba(234, 88, 12, 0.25);
+}
+
 .meta-chip--run {
   cursor: pointer;
   appearance: none;
