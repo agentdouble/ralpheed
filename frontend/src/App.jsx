@@ -107,6 +107,7 @@ const TaskCard = ({
   onDelete,
   onCodex,
   onOpenPr,
+  onBug,
   onStart,
   runState,
   onSelectLogTab,
@@ -172,6 +173,15 @@ const TaskCard = ({
             OpenPR running
           </button>
         ) : null}
+        {runState?.bug ? (
+          <button
+            className="meta-chip meta-chip--run meta-chip--bug"
+            type="button"
+            onClick={() => onSelectLogTab?.(`bug:${task.id}`)}
+          >
+            Bug running
+          </button>
+        ) : null}
       </div>
 
       {task.status === 'review' ? (
@@ -210,6 +220,14 @@ const TaskCard = ({
               disabled={isPending}
             >
               Start
+            </button>
+            <button
+              className="chip-button chip-button--bug"
+              type="button"
+              onClick={() => onBug(task.id)}
+              disabled={isPending}
+            >
+              Bug
             </button>
             <button
               className="chip-button chip-button--openpr"
@@ -291,9 +309,11 @@ export default function App() {
   const [isClearingLogs, setIsClearingLogs] = useState(false)
   const [isStoppingRalph, setIsStoppingRalph] = useState(false)
   const [isStoppingOpenPr, setIsStoppingOpenPr] = useState(false)
+  const [isStoppingBug, setIsStoppingBug] = useState(false)
   const [isExpandedLog, setIsExpandedLog] = useState(false)
   const [activeLogTab, setActiveLogTab] = useState('all')
   const [closedOpenPrTabs, setClosedOpenPrTabs] = useState(new Set())
+  const [closedBugTabs, setClosedBugTabs] = useState(new Set())
   const [workspacePath, setWorkspacePath] = useState('')
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false)
   const [workspaceDirty, setWorkspaceDirty] = useState(false)
@@ -367,6 +387,10 @@ export default function App() {
       const match = message.match(/^OPENPR_[A-Z_]+ - ([A-Z]+-\d+)/)
       return { kind: 'openpr', taskId: match ? match[1] : null }
     }
+    if (message.startsWith('BUG_')) {
+      const match = message.match(/^BUG_[A-Z_]+ - ([A-Z]+-\d+)/)
+      return { kind: 'bug', taskId: match ? match[1] : null }
+    }
     if (message.startsWith('RALPH_')) {
       const match = message.match(/^RALPH_[A-Z_]+ - ([A-Z]+-\d+)/)
       return { kind: 'ralph', taskId: match ? match[1] : null }
@@ -393,7 +417,7 @@ export default function App() {
     const map = new Map()
     const applyState = (taskId, key, value) => {
       if (!taskId) return
-      const current = map.get(taskId) || { ralph: false, openpr: false }
+      const current = map.get(taskId) || { ralph: false, openpr: false, bug: false }
       map.set(taskId, { ...current, [key]: value })
     }
 
@@ -422,6 +446,32 @@ export default function App() {
       const openError = parseLogTaskId(message, 'OPENPR_ERROR -')
       if (openError) {
         applyState(openError, 'openpr', false)
+        continue
+      }
+
+      const bugStart = parseLogTaskId(message, 'BUG_START -')
+      if (bugStart) {
+        applyState(bugStart, 'bug', true)
+        continue
+      }
+      const bugDone = parseLogTaskId(message, 'BUG_DONE -')
+      if (bugDone) {
+        applyState(bugDone, 'bug', false)
+        continue
+      }
+      const bugCut = parseLogTaskId(message, 'BUG_CUT -')
+      if (bugCut) {
+        applyState(bugCut, 'bug', false)
+        continue
+      }
+      const bugStop = parseLogTaskId(message, 'BUG_STOP -')
+      if (bugStop) {
+        applyState(bugStop, 'bug', false)
+        continue
+      }
+      const bugError = parseLogTaskId(message, 'BUG_ERROR -')
+      if (bugError) {
+        applyState(bugError, 'bug', false)
         continue
       }
 
@@ -486,6 +536,36 @@ export default function App() {
     return false
   }, [openPrRunningByTaskId])
 
+  const bugRunningByTaskId = useMemo(() => {
+    const map = new Map()
+    for (const entry of logEntries) {
+      if (entry.kind !== 'bug' || !entry.taskId) continue
+      if (entry.message.startsWith('BUG_START')) map.set(entry.taskId, true)
+      if (entry.message.startsWith('BUG_DONE')) map.set(entry.taskId, false)
+      if (entry.message.startsWith('BUG_CUT')) map.set(entry.taskId, false)
+      if (entry.message.startsWith('BUG_STOP')) map.set(entry.taskId, false)
+      if (entry.message.startsWith('BUG_ERROR')) map.set(entry.taskId, false)
+    }
+    return map
+  }, [logEntries])
+
+  const bugTaskIds = useMemo(() => {
+    const ids = new Set()
+    for (const entry of logEntries) {
+      if (entry.kind === 'bug' && entry.taskId) {
+        ids.add(entry.taskId)
+      }
+    }
+    return Array.from(ids)
+  }, [logEntries])
+
+  const bugActive = useMemo(() => {
+    for (const value of bugRunningByTaskId.values()) {
+      if (value) return true
+    }
+    return false
+  }, [bugRunningByTaskId])
+
   const logTabs = useMemo(() => {
     const tabs = [{ id: 'all', label: 'All', running: false }]
     if (logEntries.some((entry) => entry.message.startsWith('RALPH_'))) {
@@ -502,10 +582,34 @@ export default function App() {
         running,
         closable: true,
         taskId,
+        kind: 'openpr',
+      })
+    }
+    for (const taskId of bugTaskIds) {
+      const running = bugRunningByTaskId.get(taskId) === true
+      if (closedBugTabs.has(taskId) && !running) {
+        continue
+      }
+      tabs.push({
+        id: `bug:${taskId}`,
+        label: `Bug ${taskId}`,
+        running,
+        closable: true,
+        taskId,
+        kind: 'bug',
       })
     }
     return tabs
-  }, [closedOpenPrTabs, logEntries, openPrRunningByTaskId, openPrTaskIds, ralphActive])
+  }, [
+    bugRunningByTaskId,
+    bugTaskIds,
+    closedBugTabs,
+    closedOpenPrTabs,
+    logEntries,
+    openPrRunningByTaskId,
+    openPrTaskIds,
+    ralphActive,
+  ])
 
   const visibleLogs = useMemo(() => {
     if (activeLogTab === 'ralph') {
@@ -515,6 +619,12 @@ export default function App() {
       const taskId = activeLogTab.slice('openpr:'.length)
       return logEntries
         .filter((entry) => entry.kind === 'openpr' && entry.taskId === taskId)
+        .map((entry) => entry.line)
+    }
+    if (activeLogTab.startsWith('bug:')) {
+      const taskId = activeLogTab.slice('bug:'.length)
+      return logEntries
+        .filter((entry) => entry.kind === 'bug' && entry.taskId === taskId)
         .map((entry) => entry.line)
     }
     return logs
@@ -920,6 +1030,7 @@ export default function App() {
     if (data) {
       setActiveLogTab('all')
       setClosedOpenPrTabs(new Set())
+      setClosedBugTabs(new Set())
     }
   }
 
@@ -936,6 +1047,27 @@ export default function App() {
     })
   }
 
+  const handleCloseBugTab = async (taskId, running) => {
+    if (!taskId) return
+    if (running) {
+      const data = await safePost(`/api/tasks/${taskId}/bug/stop`, null, () => {})
+      if (!data) return
+    }
+    setClosedBugTabs((prev) => {
+      const next = new Set(prev)
+      next.add(taskId)
+      return next
+    })
+  }
+
+  const handleCloseLogTab = (tab) => {
+    if (tab.kind === 'bug') {
+      handleCloseBugTab(tab.taskId, tab.running)
+      return
+    }
+    handleCloseOpenPrTab(tab.taskId, tab.running)
+  }
+
   const handleStopRalph = async () => {
     if (isStoppingRalph || !activeAgentId) return
     await safePost('/api/ralph/stop', null, setIsStoppingRalph)
@@ -944,6 +1076,11 @@ export default function App() {
   const handleStopOpenPr = async () => {
     if (isStoppingOpenPr || !activeAgentId) return
     await safePost('/api/openpr/stop', null, setIsStoppingOpenPr)
+  }
+
+  const handleStopBug = async () => {
+    if (isStoppingBug || !activeAgentId) return
+    await safePost('/api/bug/stop', null, setIsStoppingBug)
   }
 
   const handleWorkspaceChange = (event) => {
@@ -1311,6 +1448,10 @@ export default function App() {
     await runTaskAction(taskId, 'openpr', 'OpenPR failed. Try again.')
   }
 
+  const handleBug = async (taskId) => {
+    await runTaskAction(taskId, 'bug', 'Bug check failed. Try again.')
+  }
+
   const handleStart = async (taskId) => {
     await runTaskAction(taskId, 'start', 'Unable to start. Try again.')
   }
@@ -1566,6 +1707,16 @@ export default function App() {
                   Stop OpenPR
                 </button>
               ) : null}
+              {bugActive ? (
+                <button
+                  className="ghost-button ghost-button--inverse"
+                  type="button"
+                  onClick={handleStopBug}
+                  disabled={isStoppingBug || !activeAgentId}
+                >
+                  Stop Bug
+                </button>
+              ) : null}
               <button
                 className="ghost-button ghost-button--inverse"
                 type="button"
@@ -1602,7 +1753,7 @@ export default function App() {
                       className="log-tab__close"
                       type="button"
                       aria-label={`Close ${tab.label}`}
-                      onClick={() => handleCloseOpenPrTab(tab.taskId, tab.running)}
+                      onClick={() => handleCloseLogTab(tab)}
                     >
                       ×
                     </button>
@@ -1704,6 +1855,7 @@ export default function App() {
                       onCodex={handleCodex}
                       onStart={handleStart}
                       onOpenPr={handleOpenPr}
+                      onBug={handleBug}
                       runState={runStateByTaskId.get(task.id)}
                       onSelectLogTab={setActiveLogTab}
                     />

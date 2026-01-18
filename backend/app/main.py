@@ -43,6 +43,21 @@ AI_TASKS_MODEL = "gpt-5.2-codex"
 AI_TASKS_REASONING_EFFORT = "low"
 AI_TASKS_CONTEXT_MAX_CHARS = 2400
 AI_TASKS_EXISTING_LIMIT = 40
+BUG_DEFAULT_PROMPT = """You are a QA assistant.
+Goal: launch the app and look for bugs or regressions.
+
+Steps:
+1) Start the app with ./start.sh and keep it running.
+2) Check backend/frontend output for errors.
+3) Open the app in a browser using the frontend URL from .env or start.sh output.
+4) Use Chrome DevTools (MCP) if available to inspect console, network, and layout issues.
+5) Identify bugs with clear reproduction steps. If a fix is quick and safe, apply it and re-check.
+
+Constraints:
+- Keep changes minimal and production-safe.
+- Do not update PRD/task status.
+- Do not commit or push; report findings and changes only.
+"""
 ACCEPTANCE_NOISE_PREFIXES = (
     "OpenAI Codex",
     "workdir:",
@@ -121,6 +136,7 @@ class AgentBoard:
     logs: list[str]
     ralph_worker: asyncio.Task[None] | None = None
     openpr_workers: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    bug_workers: dict[str, asyncio.Task[None]] = field(default_factory=dict)
 
 
 class TaskResponse(BaseModel):
@@ -1504,6 +1520,13 @@ def _start_openpr_worker(board: AgentBoard, task_id: str) -> None:
     board.openpr_workers[task_id] = asyncio.create_task(_openpr_worker_loop(board.id, task_id))
 
 
+def _start_bug_worker(board: AgentBoard, task_id: str) -> None:
+    existing = board.bug_workers.get(task_id)
+    if existing and not existing.done():
+        return
+    board.bug_workers[task_id] = asyncio.create_task(_bug_worker_loop(board.id, task_id))
+
+
 async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> None:
     proc: asyncio.subprocess.Process | None = None
     workspace_path: Path | None = None
@@ -1826,6 +1849,135 @@ async def _openpr_worker_loop(agent_id: str, task_id: str) -> None:
                 board.openpr_workers.pop(task_id, None)
 
 
+async def _bug_worker_loop(agent_id: str, task_id: str) -> None:
+    proc: asyncio.subprocess.Process | None = None
+    workspace_path: Path | None = None
+    branch = ""
+    try:
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if not board:
+                return
+            task = board.tasks.get(task_id)
+            if not task:
+                _append_log(board, f"BUG_ERROR - {task_id} Task not found")
+                return
+            if task.status != "review":
+                _append_log(board, f"BUG_ERROR - {task.id} not in review")
+                return
+
+            workspace_path = _resolve_workspace_path(board)
+            if not workspace_path:
+                _append_log(board, "WORKSPACE_INVALID - Set a valid workspace path before starting.")
+                return
+
+            branch = _resolve_task_branch(task)
+            if branch != task.branch:
+                task.branch = branch
+                task.updated_at = _utc_now()
+                _append_log(board, f"BRANCH_SET - {task.id} {branch}")
+                _persist_prd()
+
+            _append_log(board, f"BUG_START - {task.id} on {branch}")
+
+        repo_root = await asyncio.to_thread(_resolve_repo_root, workspace_path)
+        if not repo_root:
+            async with STATE_LOCK:
+                board = AGENTS.get(agent_id)
+                if not board:
+                    return
+                _append_log(board, "WORKSPACE_INVALID - Not a git repository")
+            return
+
+        worktree_path, error = await _ensure_worktree_path(repo_root, branch)
+        if not worktree_path:
+            async with STATE_LOCK:
+                board = AGENTS.get(agent_id)
+                if not board:
+                    return
+                _append_log(board, f"WORKTREE_ERROR - {error}")
+            return
+
+        copied = _copy_env_files(repo_root, worktree_path)
+        prompt_text, prompt_path = _resolve_codex_prompt("bug")
+        if not prompt_text:
+            prompt_text = BUG_DEFAULT_PROMPT
+
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if board:
+                if copied:
+                    _append_log(board, f"ENV_SYNC - {', '.join(copied)}")
+                _append_log(board, f"BUG_RUNNING - {task_id} in {worktree_path}")
+                if prompt_path:
+                    _append_log(board, f"BUG_PROMPT - {task_id} {prompt_path}")
+                else:
+                    _append_log(board, f"BUG_PROMPT - {task_id} inline")
+
+        proc = await asyncio.create_subprocess_exec(
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-m",
+            "gpt-5.2-codex",
+            "-c",
+            'model_reasoning_effort="xhigh"',
+            "--add-dir",
+            str(ROOT_DIR),
+            prompt_text,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(worktree_path),
+        )
+
+        if proc.stdout:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode(errors="replace").rstrip()
+                if not text:
+                    continue
+                async with STATE_LOCK:
+                    board = AGENTS.get(agent_id)
+                    if not board:
+                        continue
+                    _append_log(board, f"BUG_OUT - {task_id} {text}")
+
+        return_code = await proc.wait()
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if not board:
+                return
+            _sync_board_from_prd(board)
+            _append_log(board, f"BUG_DONE - {task_id} exit {return_code}")
+    except asyncio.CancelledError:
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if board:
+                _append_log(board, f"BUG_CUT - {task_id}")
+        raise
+    except Exception as exc:  # pragma: no cover
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if not board:
+                return
+            _append_log(board, f"BUG_ERROR - {task_id} {exc.__class__.__name__}: {exc}")
+    finally:
+        if proc and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 3)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        async with STATE_LOCK:
+            board = AGENTS.get(agent_id)
+            if board:
+                board.bug_workers.pop(task_id, None)
+
+
 _load_prd_state()
 
 
@@ -1879,8 +2031,12 @@ async def update_workspace(payload: WorkspaceRequest, agent_id: str | None = Non
             worker and not worker.done()
             for board in AGENTS.values()
             for worker in board.openpr_workers.values()
+        ) or any(
+            worker and not worker.done()
+            for board in AGENTS.values()
+            for worker in board.bug_workers.values()
         ):
-            raise HTTPException(status_code=409, detail="OpenPR is running")
+            raise HTTPException(status_code=409, detail="Automation is running")
         board = _get_board(agent_id)
         if path == board.workspace_path:
             return _board_state_response(board)
@@ -2260,6 +2416,25 @@ async def open_task_pr(task_id: str, agent_id: str | None = None) -> BoardStateR
         return _board_state_response(board)
 
 
+@app.post("/api/tasks/{task_id}/bug", response_model=BoardStateResponse)
+async def open_task_bug(task_id: str, agent_id: str | None = None) -> BoardStateResponse:
+    async with STATE_LOCK:
+        _ensure_mutation_allowed()
+        board = _get_board(agent_id)
+        if board.ralph_worker and not board.ralph_worker.done():
+            raise HTTPException(status_code=409, detail="Ralph is running")
+
+        task = board.tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task.status != "review":
+            raise HTTPException(status_code=409, detail="Task is not in review")
+
+        _append_log(board, f"BUG_REQUEST - {task.id}")
+        _start_bug_worker(board, task.id)
+        return _board_state_response(board)
+
+
 @app.post("/api/ralph/start", response_model=BoardStateResponse)
 async def start_ralph(
     payload: StartRalphRequest | None = None,
@@ -2309,6 +2484,21 @@ async def stop_openpr(agent_id: str | None = None) -> BoardStateResponse:
         return _board_state_response(board)
 
 
+@app.post("/api/bug/stop", response_model=BoardStateResponse)
+async def stop_bug(agent_id: str | None = None) -> BoardStateResponse:
+    async with STATE_LOCK:
+        board = _get_board(agent_id)
+        if not board.bug_workers:
+            _append_log(board, "BUG_STOP_NOOP - Not running")
+            return _board_state_response(board)
+        _append_log(board, "BUG_STOP - Requested")
+        for task_id, worker in list(board.bug_workers.items()):
+            if worker and not worker.done():
+                worker.cancel()
+                _append_log(board, f"BUG_STOP - {task_id}")
+        return _board_state_response(board)
+
+
 @app.post("/api/tasks/{task_id}/openpr/stop", response_model=BoardStateResponse)
 async def stop_openpr_task(task_id: str, agent_id: str | None = None) -> BoardStateResponse:
     async with STATE_LOCK:
@@ -2318,6 +2508,19 @@ async def stop_openpr_task(task_id: str, agent_id: str | None = None) -> BoardSt
             _append_log(board, f"OPENPR_STOP_NOOP - {task_id}")
             return _board_state_response(board)
         _append_log(board, f"OPENPR_STOP - {task_id}")
+        worker.cancel()
+        return _board_state_response(board)
+
+
+@app.post("/api/tasks/{task_id}/bug/stop", response_model=BoardStateResponse)
+async def stop_bug_task(task_id: str, agent_id: str | None = None) -> BoardStateResponse:
+    async with STATE_LOCK:
+        board = _get_board(agent_id)
+        worker = board.bug_workers.get(task_id)
+        if not worker or worker.done():
+            _append_log(board, f"BUG_STOP_NOOP - {task_id}")
+            return _board_state_response(board)
+        _append_log(board, f"BUG_STOP - {task_id}")
         worker.cancel()
         return _board_state_response(board)
 
