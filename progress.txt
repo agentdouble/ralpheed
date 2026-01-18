@@ -65,3 +65,17 @@ Started: 2024-01-15
   - Patterns discovered: none.
   - Gotchas encountered: none.
 ---
+## 2026-01-17 - US-012
+- Added a score label/value and a +1 button in the menu screen.
+- Files changed: backend/snake.py, README.md.
+- **Learnings:**
+  - Patterns discovered: none.
+  - Gotchas encountered: none.
+---
+## 2026-01-17 - US-011
+- Added eat/collision sound effects and wired them into gameplay events.
+- Files changed: assets/manger.wav, assets/collision.wav, backend/snake.py, README.md
+- **Learnings:**
+  - Patterns discovered: none.
+  - Gotchas encountered: none.
+---
