@@ -13,9 +13,14 @@ for i in $(seq 1 $MAX_ITERATIONS); do
 
   PROMPT_TEMPLATE="$(cat "$SCRIPT_DIR/prompt.md")"
   PRD_PATH="${RALPHEED_PRD_PATH:-$HOME/.ralpheed/prd/default/prd.json}"
+  PROGRESS_PATH="${RALPHEED_PROGRESS_PATH:-$(dirname "$PRD_PATH")/progress.txt}"
+  PROGRESS_DIR="$(dirname "$PROGRESS_PATH")"
+  mkdir -p "$PROGRESS_DIR"
+  touch "$PROGRESS_PATH"
   PROMPT="$(printf "%s" "$PROMPT_TEMPLATE" \
     | sed "s|{{CONTROL_ROOT}}|$SCRIPT_DIR|g" \
     | sed "s|{{WORKSPACE_ROOT}}|$WORKSPACE_ROOT|g" \
+    | sed "s|{{PROGRESS_PATH}}|$PROGRESS_PATH|g" \
     | sed "s|{{PRD_PATH}}|$PRD_PATH|g")"
 
   OUTPUT=$(codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -m gpt-5.2-codex \

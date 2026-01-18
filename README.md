@@ -34,7 +34,7 @@ Always start the app via `start.sh`:
 `start.sh` stops any existing listeners on the backend/frontend ports before starting (uses `lsof` when available).
 
 When you click Start Ralph (or call `POST /api/ralph/start`), the backend launches `ralph.sh` to run Codex iterations in a git worktree created for the task branch.
-Ralph reads and updates the PRD file for the agent workspace (under `~/.ralpheed/prd/.../prd.json`) plus `progress.txt` from this repo, and the workspace path must point to a valid git repository.
+Ralph reads and updates the PRD file for the agent workspace (under `~/.ralpheed/prd/.../prd.json`) plus `~/.ralpheed/prd/.../progress.txt`, and the workspace path must point to a valid git repository.
 New task branches are created from the latest `dev` fetched from the default remote (origin when available).
 AI task generation uses the workspace repo README for context when `workspacePath` is set; otherwise it falls back to this repo README.
 When a workspace is set, Ralph reads `AGENTS.md` from the workspace root if it exists (otherwise it uses this repo's `AGENTS.md`).

@@ -6,7 +6,7 @@ markdown
 
 1. Read `{{WORKSPACE_ROOT}}/AGENTS.md` if it exists, otherwise `{{CONTROL_ROOT}}/AGENTS.md`
 2. Read `{{PRD_PATH}}`
-3. Read `{{CONTROL_ROOT}}/progress.txt`
+3. Read `{{PROGRESS_PATH}}`
    (check Codebase Patterns first)
 4. Work in the current repo (workspace path)
 5. Check you're on the correct branch
@@ -17,11 +17,11 @@ markdown
 9. Update `{{WORKSPACE_ROOT}}/AGENTS.md` if it exists, otherwise `{{CONTROL_ROOT}}/AGENTS.md`
 10. Commit: `feat: [ID] - [Title]`
 11. Update `{{PRD_PATH}}`: `passes: true`, `status: review`
-12. Append learnings to `{{CONTROL_ROOT}}/progress.txt`
+12. Append learnings to `{{PROGRESS_PATH}}`
 
 ## Progress Format
 
-APPEND to {{CONTROL_ROOT}}/progress.txt:
+APPEND to {{PROGRESS_PATH}}:
 
 ## [Date] - [Story ID]
 - What was implemented
@@ -34,7 +34,7 @@ APPEND to {{CONTROL_ROOT}}/progress.txt:
 ## Codebase Patterns
 
 Add reusable patterns to the TOP 
-of progress.txt:
+of {{PROGRESS_PATH}}:
 
 ## Codebase Patterns
 - Migrations: Use IF NOT EXISTS
