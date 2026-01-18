@@ -51,7 +51,7 @@ CORS_ORIGINS=
 ```
 
 ## PRD storage
-Agents are indexed in `~/.ralpheed/prd/index.json`. Task state is stored per workspace under `~/.ralpheed/prd/<workspace>/prd.json`, where `<workspace>` is derived from the git root of the configured workspace path. When no workspace is set, the agent uses `~/.ralpheed/prd/default/prd.json`. On first run, legacy PRD data is migrated into the workspace files and index. Multi-agent state is stored under `agents`, each with `id`, `name`, `branchName`, `workspacePath`, and `userStories`. Story ids are auto-generated (`US-###`) and priority defaults to P1. The UI adds optional fields per story (`status`, `owner`, `effort`, `branch`, `commit`, `summary`) to keep board state and Ralph output.
+Agents are indexed in `~/.ralpheed/prd/index.json`. Task state is stored per workspace under `~/.ralpheed/prd/<workspace>/prd.json`, where `<workspace>` is derived from the git root of the configured workspace path. When no workspace is set, the agent uses `~/.ralpheed/prd/default/prd.json`. On first run, legacy PRD data is migrated into the workspace files and index. Multi-agent state is stored under `agents`, each with `id`, `name`, `branchName`, `workspacePath`, and `userStories`. Story ids are auto-generated (`US-###`) and priority defaults to P1. The UI adds optional fields per story (`status`, `owner`, `effort`, `worktree`, `waitForValidation`, `branch`, `commit`, `summary`) to keep board state and Ralph output.
 
 ## API quick reference
 - When `agent_id` is omitted, the API uses the first agent in the index.
@@ -67,15 +67,16 @@ Agents are indexed in `~/.ralpheed/prd/index.json`. Task state is stored per wor
   - body: `{ "count": 3, "theme": "..." }`
   - response: `{ "tasks": [ ... ] }`
 - `POST /api/tasks?agent_id=agent-1`
-  - body: `{ "title": "...", "acceptance_criteria": ["..."], "priority": 1-3, "passes": false, "notes": "...", "status": "backlog|todo|review|done" }`
+  - body: `{ "title": "...", "acceptance_criteria": ["..."], "priority": 1-3, "passes": false, "notes": "...", "status": "backlog|todo|review|done", "worktree": "feature/epic", "wait_for_validation": false }`
 - `PATCH /api/tasks/{task_id}?agent_id=agent-1`
-  - body: `{ "status": "backlog|todo|review|done", "priority": 1-3, "passes": true, "notes": "...", ... }`
+  - body: `{ "status": "backlog|todo|review|done", "priority": 1-3, "passes": true, "notes": "...", "worktree": "feature/epic", "wait_for_validation": false, ... }`
 - `POST /api/tasks/{task_id}/codex?agent_id=agent-1` (review only; opens iTerm running Codex in the task worktree)
 - `POST /api/tasks/{task_id}/start?agent_id=agent-1` (review only; opens iTerm and runs `./start.sh` in the task worktree)
 - `POST /api/tasks/{task_id}/openpr?agent_id=agent-1` (review only; runs the `openpr` prompt via Codex; uses `prompts/openpr.md` or `~/.codex/prompts/openpr.md` when present, otherwise sends `/prompts:openpr`)
 - `POST /api/tasks/{task_id}/openpr/stop?agent_id=agent-1`
 
 Ralph only processes tasks in `todo`.
+Tasks with the same `worktree` share a git worktree; Ralph processes them by priority, and `wait_for_validation` blocks later tasks until the gated task reaches `review`.
 Setting `passes` to true moves a `todo` task to `review` automatically.
 Ralph processes todo tasks in rounds (up to the `iterations` count); tasks that stay `todo` are retried in the next round.
 Approving a review automatically triggers the OpenPR flow (the OpenPR button remains available for manual runs).

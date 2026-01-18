@@ -116,6 +116,9 @@ const TaskCard = ({
   const criteria = Array.isArray(task.acceptance_criteria) ? task.acceptance_criteria : []
   const preview = criteria.slice(0, 3)
   const remaining = criteria.length - preview.length
+  const worktree = typeof task.worktree === 'string' ? task.worktree.trim() : ''
+  const branch = typeof task.branch === 'string' ? task.branch.trim() : ''
+  const showBranch = branch && (!worktree || worktree !== branch)
 
   return (
     <article
@@ -146,9 +149,11 @@ const TaskCard = ({
       <div className="board-task__meta">
         {task.owner ? <span className="meta-chip">{task.owner}</span> : null}
         {task.effort ? <span className="meta-chip">{task.effort}</span> : null}
-        {task.branch ? <span className="meta-chip meta-chip--mono">{task.branch}</span> : null}
+        {worktree ? <span className="meta-chip meta-chip--mono">WT {worktree}</span> : null}
+        {showBranch ? <span className="meta-chip meta-chip--mono">{branch}</span> : null}
         {task.commit ? <span className="meta-chip meta-chip--mono">{task.commit}</span> : null}
         {task.passes ? <span className="meta-chip meta-chip--pass">Passes</span> : null}
+        {task.wait_for_validation ? <span className="meta-chip meta-chip--gate">Gate</span> : null}
         {runState?.ralph ? (
           <button
             className="meta-chip meta-chip--run meta-chip--ralph"
@@ -271,6 +276,8 @@ export default function App() {
   const [newPriority, setNewPriority] = useState('1')
   const [newPasses, setNewPasses] = useState(false)
   const [newNotes, setNewNotes] = useState('')
+  const [newWorktree, setNewWorktree] = useState('')
+  const [newWaitForValidation, setNewWaitForValidation] = useState(false)
   const [newStatus, setNewStatus] = useState('backlog')
   const [isSavingTask, setIsSavingTask] = useState(false)
   const [isGeneratingCriteria, setIsGeneratingCriteria] = useState(false)
@@ -676,6 +683,8 @@ export default function App() {
     setNewPriority('1')
     setNewPasses(false)
     setNewNotes('')
+    setNewWorktree('')
+    setNewWaitForValidation(false)
     setNewStatus('backlog')
     setIsSavingTask(false)
     setIsGeneratingCriteria(false)
@@ -704,6 +713,8 @@ export default function App() {
     setNewPriority('1')
     setNewPasses(false)
     setNewNotes('')
+    setNewWorktree('')
+    setNewWaitForValidation(false)
     setNewStatus(status)
   }
 
@@ -749,12 +760,23 @@ export default function App() {
     setNewPriority(String(clampPriority(task.priority)))
     setNewPasses(Boolean(task.passes))
     setNewNotes(task.notes ?? '')
+    setNewWorktree(task.worktree ?? '')
+    setNewWaitForValidation(Boolean(task.wait_for_validation))
     setNewStatus(normalizeStatus(task.status))
     setIsAddOpen(true)
     setActionError('')
   }
 
-  const createTask = async ({ title, acceptance_criteria, priority, passes, notes, status }) => {
+  const createTask = async ({
+    title,
+    acceptance_criteria,
+    priority,
+    passes,
+    notes,
+    status,
+    worktree,
+    wait_for_validation,
+  }) => {
     if (!activeAgentId) throw new Error('No agent selected')
     const requestAgentId = activeAgentId
     const payload = {
@@ -764,6 +786,12 @@ export default function App() {
       passes,
       notes,
       status,
+    }
+    if (typeof worktree === 'string') {
+      payload.worktree = worktree
+    }
+    if (typeof wait_for_validation === 'boolean') {
+      payload.wait_for_validation = wait_for_validation
     }
 
     const res = await fetch(buildAgentUrl('/api/tasks', requestAgentId), {
@@ -949,6 +977,7 @@ export default function App() {
     setIsSavingTask(true)
     setActionError('')
     try {
+      const worktree = newWorktree.trim()
       const payload = {
         title,
         acceptance_criteria: acceptance,
@@ -956,6 +985,8 @@ export default function App() {
         passes: newPasses,
         notes: newNotes.trim(),
         status: isEditing ? newStatus : newStatus === 'done' ? 'review' : newStatus,
+        worktree,
+        wait_for_validation: newWaitForValidation,
       }
 
       if (isEditing) {
@@ -1724,6 +1755,15 @@ export default function App() {
                 </label>
               </div>
               <label className="field">
+                <span>Worktree</span>
+                <input
+                  value={newWorktree}
+                  onChange={(event) => setNewWorktree(event.target.value)}
+                  placeholder="feature/epic"
+                  maxLength={120}
+                />
+              </label>
+              <label className="field">
                 <div className="field__row">
                   <span>Acceptance criteria (one per line)</span>
                   <button
@@ -1750,6 +1790,14 @@ export default function App() {
                   placeholder="Extra context for Ralph and reviewers"
                   rows={3}
                 />
+              </label>
+              <label className="field field--toggle">
+                <input
+                  type="checkbox"
+                  checked={newWaitForValidation}
+                  onChange={(event) => setNewWaitForValidation(event.target.checked)}
+                />
+                <span>Wait for review</span>
               </label>
               <label className="field field--toggle">
                 <input
