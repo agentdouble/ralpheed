@@ -2195,11 +2195,7 @@ async def open_task_codex(task_id: str, agent_id: str | None = None) -> BoardSta
 @app.post("/api/tasks/{task_id}/start", response_model=BoardStateResponse)
 async def open_task_start(task_id: str, agent_id: str | None = None) -> BoardStateResponse:
     async with STATE_LOCK:
-        _ensure_mutation_allowed()
         board = _get_board(agent_id)
-        if board.ralph_worker and not board.ralph_worker.done():
-            raise HTTPException(status_code=409, detail="Ralph is running")
-
         task = board.tasks.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
