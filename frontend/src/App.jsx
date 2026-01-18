@@ -153,7 +153,7 @@ const TaskCard = ({
         {showBranch ? <span className="meta-chip meta-chip--mono">{branch}</span> : null}
         {task.commit ? <span className="meta-chip meta-chip--mono">{task.commit}</span> : null}
         {task.passes ? <span className="meta-chip meta-chip--pass">Passes</span> : null}
-        {task.wait_for_validation ? <span className="meta-chip meta-chip--gate">Gate</span> : null}
+        {task.wait_for_validation ? <span className="meta-chip meta-chip--gate">principal tache</span> : null}
         {runState?.ralph ? (
           <button
             className="meta-chip meta-chip--run meta-chip--ralph"
@@ -1797,7 +1797,7 @@ export default function App() {
                   checked={newWaitForValidation}
                   onChange={(event) => setNewWaitForValidation(event.target.checked)}
                 />
-                <span>Wait for review</span>
+                <span>principal tache</span>
               </label>
               <label className="field field--toggle">
                 <input

@@ -463,7 +463,7 @@ def _build_ai_tasks_prompt(count: int, theme: str, readme: str, existing_titles:
         "4) Avoid duplicates of existing tasks.\n"
         "5) Use the same language as the theme if provided; otherwise use the README language.\n"
         "6) If tasks depend on each other, give them the same worktree.\n"
-        "7) Set wait_for_validation=true on the blocking task.\n"
+        "7) Set wait_for_validation=true on the principal tache.\n"
     )
 
 
@@ -1079,13 +1079,36 @@ def _copy_env_files(source: Path, dest: Path) -> list[str]:
     copied: list[str] = []
     if not source.is_dir() or not dest.is_dir():
         return copied
-    for item in source.iterdir():
-        if not item.is_file():
-            continue
-        name = item.name
-        if name == ".env" or name.startswith(".env."):
-            shutil.copy2(item, dest / name)
-            copied.append(name)
+    skip_dirs = {
+        ".git",
+        ".venv",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".idea",
+        ".vscode",
+        "dist",
+        "build",
+        "out",
+        ".next",
+        ".turbo",
+        ".cache",
+    }
+    for root, dirs, files in os.walk(source):
+        dirs[:] = [name for name in dirs if name not in skip_dirs]
+        for filename in files:
+            if filename != ".env" and not filename.startswith(".env."):
+                continue
+            src_path = Path(root) / filename
+            rel_path = src_path.relative_to(source)
+            dest_path = dest / rel_path
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dest_path)
+            copied.append(str(rel_path))
+    copied.sort()
     return copied
 
 
@@ -1135,7 +1158,7 @@ def _task_blocked_by_validation(
     for sibling in group:
         if sibling.id == task.id:
             break
-        if sibling.wait_for_validation and sibling.status not in {"review", "done"}:
+        if sibling.wait_for_validation and not sibling.passes and sibling.status not in {"review", "done"}:
             return True
     return False
 
@@ -1523,6 +1546,16 @@ async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> No
                 if not board:
                     return
 
+                promoted = False
+                for task in board.tasks.values():
+                    if task.passes and task.status not in {"review", "done"}:
+                        task.status = "review"
+                        task.updated_at = _utc_now()
+                        _append_log(board, f"STATUS_AUTO - {task.id} passes -> review")
+                        promoted = True
+                if promoted:
+                    _persist_prd()
+
                 order_index = {task_id: index for index, task_id in enumerate(board.order)}
                 todo_ids = [
                     task_id
@@ -1543,7 +1576,7 @@ async def _agent_worker_loop(agent_id: str, iterations: int | None = None) -> No
                     return
                 if not eligible_ids:
                     _set_agent_waiting(board)
-                    _append_log(board, "RALPH_WAITING - Waiting for review")
+                    _append_log(board, "RALPH_WAITING - Waiting for principal tache")
                     return
 
                 if round_index >= max_rounds:

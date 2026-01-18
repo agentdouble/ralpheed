@@ -4,7 +4,7 @@ markdown
 
 ## Your Task
 
-1. Read `{{CONTROL_ROOT}}/AGENTS.md`
+1. Read `{{WORKSPACE_ROOT}}/AGENTS.md` if it exists, otherwise `{{CONTROL_ROOT}}/AGENTS.md`
 2. Read `{{PRD_PATH}}`
 3. Read `{{CONTROL_ROOT}}/progress.txt`
    (check Codebase Patterns first)
@@ -14,9 +14,9 @@ markdown
    where `passes: false`
 7. Implement that ONE story
 8. Run typecheck and tests
-9. Update `{{CONTROL_ROOT}}/AGENTS.md` with learnings if needed
+9. Update `{{WORKSPACE_ROOT}}/AGENTS.md` if it exists, otherwise `{{CONTROL_ROOT}}/AGENTS.md`
 10. Commit: `feat: [ID] - [Title]`
-11. Update `{{PRD_PATH}}`: `passes: true`
+11. Update `{{PRD_PATH}}`: `passes: true`, `status: review`
 12. Append learnings to `{{CONTROL_ROOT}}/progress.txt`
 
 ## Progress Format

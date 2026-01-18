@@ -37,7 +37,8 @@ When you click Start Ralph (or call `POST /api/ralph/start`), the backend launch
 Ralph reads and updates the PRD file for the agent workspace (under `~/.ralpheed/prd/.../prd.json`) plus `progress.txt` from this repo, and the workspace path must point to a valid git repository.
 New task branches are created from the latest `dev` fetched from the default remote (origin when available).
 AI task generation uses the workspace repo README for context when `workspacePath` is set; otherwise it falls back to this repo README.
-Worktrees are created under a sibling folder named `<repo>-worktrees`, and `.env`/`.env.*` files are copied into each worktree.
+When a workspace is set, Ralph reads `AGENTS.md` from the workspace root if it exists (otherwise it uses this repo's `AGENTS.md`).
+Worktrees are created under a sibling folder named `<repo>-worktrees`, and all `.env`/`.env.*` files are copied into each worktree with their relative paths preserved.
 `ralph.sh` runs Codex non-interactively with approvals bypassed so runs do not pause for follow-ups.
 
 ## Config
@@ -76,7 +77,7 @@ Agents are indexed in `~/.ralpheed/prd/index.json`. Task state is stored per wor
 - `POST /api/tasks/{task_id}/openpr/stop?agent_id=agent-1`
 
 Ralph only processes tasks in `todo`.
-Tasks with the same `worktree` share a git worktree; Ralph processes them by priority, and `wait_for_validation` blocks later tasks until the gated task reaches `review`.
+Tasks with the same `worktree` share a git worktree; Ralph processes them by priority, and `wait_for_validation` marks the principal tache, blocking later tasks until it passes or reaches `review`.
 Setting `passes` to true moves a `todo` task to `review` automatically.
 Ralph processes todo tasks in rounds (up to the `iterations` count); tasks that stay `todo` are retried in the next round.
 Approving a review automatically triggers the OpenPR flow (the OpenPR button remains available for manual runs).
